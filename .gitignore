@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+cache/
+dependencias_offline/
+*.log
+.venv/
+venv/
