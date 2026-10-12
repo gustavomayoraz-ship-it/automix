@@ -42,6 +42,179 @@ try:                                  # el proceso hijo del análisis deja sus e
 except Exception:
     pass
 
+# (módulo, paquete de pip): si falta alguno dentro de ./dependencias_offline se descarga ahí al abrir el programa
+DEPENDENCIAS = [("numpy", "numpy"), ("scipy", "scipy"), ("soundfile", "soundfile"),
+                ("sounddevice", "sounddevice"), ("librosa", "librosa"), ("PySide6", "PySide6")]
+
+
+def _modulo_en_offline(mod):
+    try:
+        return (OFFLINE / mod).is_dir() or any(OFFLINE.glob(mod + ".*")) or (OFFLINE / (mod + ".py")).exists()
+    except Exception:
+        return False
+
+
+def _instalar_en_offline(pq):
+    """Descarga/instala un paquete (con sus dependencias) dentro de ./dependencias_offline.
+    Devuelve (ok, detalle)."""
+    import subprocess
+    exe = sys.executable
+    if os.name == "nt" and exe.lower().endswith("pythonw.exe"):
+        cand = exe[:-len("pythonw.exe")] + "python.exe"
+        if os.path.exists(cand):
+            exe = cand
+    kw = {"creationflags": 0x08000000} if os.name == "nt" else {}      # CREATE_NO_WINDOW
+    try:
+        OFFLINE.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run([exe, "-m", "pip", "install", "--target", str(OFFLINE),
+                            "--disable-pip-version-check", pq],
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL, **kw)
+        ok = (r.returncode == 0)
+        det = None if ok else (r.stderr or r.stdout or "pip no devolvió detalle.").strip()
+    except Exception as e:
+        ok, det = False, str(e)
+    try:
+        with open(CACHE_DIR / "dependencias.log", "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S") + "  " + pq + "  " + ("OK" if ok else "ERROR\n" + str(det)) + "\n")
+    except Exception:
+        pass
+    return ok, det
+
+
+def asegurar_dependencias():
+    """Ventana (tkinter, igual a la del reproductor anterior) que verifica las dependencias dentro de
+    ./dependencias_offline y descarga ahí las que falten. Solo corre en el proceso principal."""
+    try:
+        import multiprocessing as _mp1
+        if _mp1.parent_process() is not None:
+            return
+    except Exception:
+        pass
+    try:
+        import tkinter as tk
+        from tkinter import ttk, messagebox
+    except Exception:                                  # sin tkinter: descarga igual, sin ventana
+        for m, pq in DEPENDENCIAS:
+            if not _modulo_en_offline(m):
+                _instalar_en_offline(pq)
+        return
+    import threading, queue
+    cola = queue.Queue()
+    errores = {}
+
+    class Ventana(tk.Tk):
+        def __init__(self):
+            super().__init__()
+            self.title("🔍 Verificación de dependencias")
+            self.resizable(False, False)
+            self.configure(bg="#f8f9fa")
+            self.attributes("-topmost", True)
+            self.estados = {}
+            self.cerrado = False
+            cont = tk.Frame(self, bg="#f8f9fa", padx=20, pady=15)
+            cont.pack(fill="both", expand=True)
+            tk.Label(cont, text="📦 Verificando dependencias", font=("Segoe UI", 14, "bold"),
+                     bg="#f8f9fa", fg="#2c3e50").pack(anchor="w")
+            tk.Label(cont, text="Se guardan en la carpeta dependencias_offline", font=("Segoe UI", 9),
+                     bg="#f8f9fa", fg="#7f8c8d").pack(anchor="w", pady=(0, 12))
+            for _mod, nombre in DEPENDENCIAS:
+                fila = tk.Frame(cont, bg="#f8f9fa")
+                fila.pack(fill="x", pady=2)
+                tk.Label(fila, text=nombre, font=("Segoe UI", 9, "bold"), bg="#f8f9fa", fg="#2c3e50",
+                         width=14, anchor="w").pack(side="left")
+                lbl = tk.Label(fila, text="⏳ Pendiente", font=("Segoe UI", 9), bg="#f8f9fa",
+                               fg="#7f8c8d", anchor="w")
+                lbl.pack(side="left", fill="x", expand=True)
+                lbl.bind("<Button-1>", lambda e, n=nombre: self._detalle(n))
+                self.estados[nombre] = lbl
+            self.barra = ttk.Progressbar(cont, mode="determinate", length=380)
+            self.barra.pack(fill="x", pady=(10, 6))
+            self.general = tk.Label(cont, text="🔍 Iniciando verificación...", font=("Segoe UI", 9),
+                                    bg="#f8f9fa", fg="#2c3e50", anchor="w", justify="left", wraplength=360)
+            self.general.pack(fill="x", pady=(0, 4))
+            self.btn = tk.Button(cont, text="🔄 Reintentar", font=("Segoe UI", 9, "bold"), bg="#2ecc71",
+                                 fg="white", relief="flat", padx=10, pady=6, command=self._reintentar)
+            self.update_idletasks()
+            w, h = 420, self.winfo_reqheight() + 16
+            self.geometry("%dx%d+%d+%d" % (w, h, (self.winfo_screenwidth() - w) // 2,
+                                           (self.winfo_screenheight() - h) // 2))
+            self.protocol("WM_DELETE_WINDOW", self._cerrar)
+            self.after(60, self._leer)
+            self._lanzar()
+
+        def _detalle(self, n):
+            if errores.get(n):
+                messagebox.showerror("Error instalando '%s'" % n, errores[n])
+
+        def _lanzar(self):
+            threading.Thread(target=self._trabajo, daemon=True).start()
+
+        def _trabajo(self):
+            total = len(DEPENDENCIAS)
+            hubo = False
+            for i, (mod, pq) in enumerate(DEPENDENCIAS):
+                cola.put(("gen", "🔍 Verificando %s..." % pq))
+                if _modulo_en_offline(mod):
+                    cola.put(("est", pq, "✅ Instalado", "#27ae60"))
+                else:
+                    cola.put(("est", pq, "⬇️ Descargando...", "#e67e22"))
+                    cola.put(("gen", "⬇️ Descargando %s a dependencias_offline (puede tardar unos minutos)..." % pq))
+                    ok, det = _instalar_en_offline(pq)
+                    if ok and _modulo_en_offline(mod):
+                        cola.put(("est", pq, "✅ Descargado", "#27ae60"))
+                    else:
+                        hubo = True
+                        errores[pq] = det or "El paquete se instaló pero no aparece en dependencias_offline."
+                        cola.put(("est", pq, "❌ Error -- click acá para ver el detalle", "#e74c3c"))
+                cola.put(("bar", (i + 1) / total * 100))
+            cola.put(("fin", hubo))
+
+        def _leer(self):
+            try:
+                while True:
+                    m = cola.get_nowait()
+                    if m[0] == "est":
+                        self.estados[m[1]].config(text=m[2], fg=m[3])
+                    elif m[0] == "gen":
+                        self.general.config(text=m[1], fg="#2c3e50")
+                    elif m[0] == "bar":
+                        self.barra["value"] = m[1]
+                    elif m[0] == "fin":
+                        if m[1]:
+                            self.general.config(text="⚠️ Alguna dependencia no se pudo descargar -- hacé click "
+                                                "en su estado para ver el motivo, solucionalo y reintentá.",
+                                                fg="#e74c3c")
+                            self.btn.pack(pady=(0, 4))
+                            self.update_idletasks()
+                            self.geometry("420x%d" % (self.winfo_reqheight() + 16))
+                        else:
+                            self.general.config(text="✅ Todo listo, iniciando...", fg="#2c3e50")
+                            self.after(500, self.destroy)
+                        return self.after(60, self._leer) if m[1] else None
+            except queue.Empty:
+                pass
+            self.after(60, self._leer)
+
+        def _reintentar(self):
+            self.btn.pack_forget()
+            errores.clear()
+            for lbl in self.estados.values():
+                lbl.config(text="⏳ Pendiente", fg="#7f8c8d")
+            self.barra["value"] = 0
+            self._lanzar()
+
+        def _cerrar(self):
+            self.cerrado = True
+            self.destroy()
+
+    v = Ventana()
+    v.mainloop()
+    if v.cerrado:
+        sys.exit(0)
+
+
+asegurar_dependencias()
+
 if OFFLINE.exists():
     sys.path.insert(0, str(OFFLINE))
     if os.name == "nt" and hasattr(os, "add_dll_directory"):
