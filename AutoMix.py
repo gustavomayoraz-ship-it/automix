@@ -213,18 +213,6 @@ def asegurar_dependencias():
         sys.exit(0)
 
 
-asegurar_dependencias()
-
-if OFFLINE.exists():
-    sys.path.insert(0, str(OFFLINE))
-    if os.name == "nt" and hasattr(os, "add_dll_directory"):
-        try:
-            os.add_dll_directory(str(OFFLINE))
-        except Exception:
-            pass
-    os.environ["PATH"] = str(OFFLINE) + os.pathsep + os.environ.get("PATH", "")
-
-
 # =====================================================================
 # 1.5) CONSOLA OCULTA (con botón 🖥 para verla cuando haga falta)
 # =====================================================================
@@ -437,6 +425,18 @@ try:
         CONSOLA.instalar()
 except Exception:
     pass
+
+# La consola ya está oculta: recién ahora se verifican/descargan las dependencias (ventana tkinter)
+asegurar_dependencias()
+
+if OFFLINE.exists():
+    sys.path.insert(0, str(OFFLINE))
+    if os.name == "nt" and hasattr(os, "add_dll_directory"):
+        try:
+            os.add_dll_directory(str(OFFLINE))
+        except Exception:
+            pass
+    os.environ["PATH"] = str(OFFLINE) + os.pathsep + os.environ.get("PATH", "")
 
 import numpy as np
 import soundfile as sf
