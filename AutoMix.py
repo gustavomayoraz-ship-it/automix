@@ -3687,8 +3687,15 @@ class AutoMix(QMainWindow):
         self.deck_a.on_reset_cb = self._on_reset_deck
         self.deck_b.on_reset_cb = self._on_reset_deck
         self.panel_cruce = PanelCruce(self)
-        decks_row.addWidget(self.deck_a, stretch=1)
-        decks_row.addWidget(self.deck_b, stretch=1)
+        izq = QVBoxLayout(); izq.setSpacing(6); izq.setContentsMargins(0, 0, 0, 0)       # columna de los dos decks (+ la duración debajo)
+        decks_ab = QHBoxLayout(); decks_ab.setSpacing(14); decks_ab.setContentsMargins(0, 0, 0, 0)
+        decks_ab.addWidget(self.deck_a, stretch=1)
+        decks_ab.addWidget(self.deck_b, stretch=1)
+        izq.addLayout(decks_ab)
+        izq.addStretch(1)
+        self._fila_duracion = QHBoxLayout(); self._fila_duracion.setContentsMargins(0, 0, 0, 0); self._fila_duracion.setSpacing(6)
+        izq.addLayout(self._fila_duracion)       # a la altura del botón "Valores por defecto", justo debajo de los dos decks
+        decks_row.addLayout(izq, stretch=1)
         decks_row.addWidget(self.panel_cruce, alignment=Qt.AlignmentFlag.AlignTop)
         root.addLayout(decks_row)
 
@@ -3972,11 +3979,12 @@ class AutoMix(QMainWindow):
         self.btn_mix.setGraphicsEffect(_glow)
         der.addWidget(self.btn_mix)
         self.spin_mix.setFixedWidth(58)           # corto: solo el número
-        f_dur = QHBoxLayout(); f_dur.addWidget(self.lbl_dur); f_dur.addWidget(self.spin_mix)
+        f_dur = self._fila_duracion               # la duración vive debajo de los dos decks (se arma acá porque el spin se crea antes)
+        f_dur.addStretch(1)
+        f_dur.addWidget(self.lbl_dur); f_dur.addWidget(self.spin_mix)
         f_dur.addSpacing(6)
         f_dur.addStretch(1)
-        self._f_dur = f_dur                       # el botón de la consola se agrega acá al lado
-        der.addLayout(f_dur)
+        self._f_dur = f_dur                       # el botón de la consola se agrega acá al lado (antes del último estirador)
         f_vol = QHBoxLayout(); f_vol.addWidget(QLabel("🔊 Volumen")); f_vol.addWidget(self.sld_master, 1); f_vol.addWidget(self.lbl_master)
         self.crossfader.setToolTip("Crossfader A ↔ B (volumen + BPM compartido)")
         der.addLayout(self._cf_row)
