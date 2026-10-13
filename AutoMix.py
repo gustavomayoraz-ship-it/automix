@@ -445,6 +445,7 @@ import librosa
 from scipy.signal import butter, sosfilt
 
 from PySide6.QtWidgets import (
+    QStyledItemDelegate,
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QFileDialog, QGroupBox,
     QGraphicsView, QGraphicsScene, QGraphicsLineItem, QGraphicsPolygonItem,
@@ -1220,7 +1221,7 @@ QSpinBox::down-arrow {{ {img('abajo')} width:10px; height:10px; }}
 
 QListWidget {{ background:#080b14; border:1px solid {T['linea']}; border-radius:10px; alternate-background-color:#0c111f; outline:0; padding:3px; }}
 QListWidget::item {{ padding:3px 6px; border-radius:5px; }}
-QListWidget::item:selected {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #1d5a7a, stop:1 #16263f); color:#ffffff; }}
+QListWidget::item:selected {{ border:2px solid #ffffff; color:#ffffff; }}
 
 QScrollBar:vertical {{ background:transparent; width:10px; margin:2px; }}
 QScrollBar::handle:vertical {{ background:#2a3554; border-radius:4px; min-height:26px; }}
@@ -1412,6 +1413,25 @@ class EtiquetaElidida(QLabel):
             self._recortar()
 
 
+class EtiquetaTema(EtiquetaElidida):
+    """Nombre del tema de un deck: al hacer clic avisa para ubicarlo en la lista de la biblioteca."""
+    clicked = Signal()
+
+    def __init__(self, texto=""):
+        super().__init__(texto)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+
+    def _recortar(self):
+        super()._recortar()
+        base = self.toolTip()
+        self.setToolTip((base + "\n" if base else "") + "Clic: ubicar este tema en la lista")
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(e)
+
+
 class Deck(QFrame):
     def __init__(self, name, color, on_analysis_cb):
         super().__init__()
@@ -1455,7 +1475,9 @@ class Deck(QFrame):
         self.lbl_title.setStyleSheet(f"color:{color}; font-size:16px; font-weight:bold;")
         self.lbl_title.setFixedWidth(112)
         r1.addWidget(self.lbl_title)
-        self.lbl_track = EtiquetaElidida("Arrastrá una canción aquí")
+        self.lbl_track = EtiquetaTema("Arrastrá una canción aquí")
+        self.on_ubicar_cb = None
+        self.lbl_track.clicked.connect(lambda: self.on_ubicar_cb(self.path) if self.on_ubicar_cb else None)
         self.lbl_track.setStyleSheet(f"color:{TEMA['texto']}; font-size:11px;")
         r1.addWidget(self.lbl_track, stretch=1)
         lay.addLayout(r1)
@@ -2904,6 +2926,19 @@ def _escanear(rutas):
     return out
 
 
+class _DelegadoFondo(QStyledItemDelegate):
+    """Pinta el fondo (BackgroundRole) del item: la hoja de estilos lo ignora."""
+    def paint(self, painter, option, index):
+        br = index.data(Qt.ItemDataRole.BackgroundRole)
+        if br is not None and br != QBrush():
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(Qt.PenStyle.NoPen); painter.setBrush(br)
+            painter.drawRoundedRect(option.rect.adjusted(1, 1, -1, -1), 5, 5)
+            painter.restore()
+        super().paint(painter, option, index)
+
+
 class Biblioteca(QListWidget):
     cambio = Signal()
     nuevos = Signal()          # se agregaron temas: hay que analizarlos
@@ -2917,6 +2952,7 @@ class Biblioteca(QListWidget):
         self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
         self.setDefaultDropAction(Qt.DropAction.CopyAction)
         self.setUniformItemSizes(True)
+        self.setItemDelegate(_DelegadoFondo(self))
         self.setAlternatingRowColors(True)
         f = self.font(); f.setPointSize(int(round(9 * FUENTE_BOOST))); self.setFont(f)
         self._rutas = set()
@@ -3086,9 +3122,9 @@ class Biblioteca(QListWidget):
             ruta = it.data(Qt.ItemDataRole.UserRole)
             k = os.path.normcase(os.path.abspath(ruta))
             if k == ka:
-                it.setBackground(QBrush(QColor("#0c3f57"))); it.setForeground(QBrush(QColor("#8eeaff")))
+                it.setBackground(QBrush(QColor(COLOR_DECK_A))); it.setForeground(QBrush(QColor(TEMA["bg0"])))
             elif k == kb:
-                it.setBackground(QBrush(QColor("#511634"))); it.setForeground(QBrush(QColor("#ff9ccd")))
+                it.setBackground(QBrush(QColor(COLOR_DECK_B))); it.setForeground(QBrush(QColor(TEMA["bg0"])))
             else:
                 nivel = compat_armonica(self._referencia, self.info(ruta)[1]) if self._referencia else None
                 if nivel == 2:                      # misma clave o relativa
@@ -3648,14 +3684,13 @@ class AutoMix(QMainWindow):
         self.biblioteca = Biblioteca()
         lib_lay.addWidget(self.biblioteca, stretch=1)
         lib_btns = QHBoxLayout()
-        b_quitar = QPushButton("Quitar"); b_quitar.clicked.connect(self.biblioteca.quitar_seleccion)
         b_limpiar = QPushButton("Vaciar"); b_limpiar.clicked.connect(self.biblioteca.limpiar)
         self.btn_ordenar = QPushButton("🔃 Ordenar por BPM")
         self.btn_ordenar.clicked.connect(self._ordenar_biblioteca_bpm)
         self.btn_reanalizar = QPushButton("🔄 Re-analizar")
         self.btn_reanalizar.setToolTip("Vuelve a analizar el BPM de TODOS los temas de la lista (guía: el BPM del nombre del archivo)")
         self.btn_reanalizar.clicked.connect(self._reanalizar_biblioteca)
-        lib_btns.addWidget(b_quitar); lib_btns.addWidget(b_limpiar); lib_btns.addWidget(self.btn_ordenar)
+        lib_btns.addWidget(b_limpiar); lib_btns.addWidget(self.btn_ordenar)
         lib_btns.addWidget(self.btn_reanalizar)
         lib_lay.addLayout(lib_btns)
         cfg_mi = leer_config()
@@ -3689,6 +3724,7 @@ class AutoMix(QMainWindow):
         decks_row.setSpacing(14)
         self.deck_a = Deck("A", COLOR_DECK_A, self._on_analysis)
         self.deck_b = Deck("B", COLOR_DECK_B, self._on_analysis)
+        self.deck_a.on_ubicar_cb = self.deck_b.on_ubicar_cb = self._ubicar_en_lista
         self.deck_a.on_play_cb = self._auto_sync
         self.deck_b.on_play_cb = self._auto_sync
         # Callback para que el botón reset avise a la ventana y se redibuje el timeline
@@ -4642,6 +4678,26 @@ class AutoMix(QMainWindow):
     def _biblioteca_cambio(self):
         self.lbl_lib.setText(f"📁 Biblioteca ({self.biblioteca.count()})")
         self.biblioteca.guardar()
+
+    def _ubicar_en_lista(self, path):
+        """Clic en el nombre del tema de un deck: lo busca en la biblioteca, lo selecciona y lo deja a la vista."""
+        if not path:
+            self._set_status("No hay ningún tema cargado en ese deck")
+            return
+        bib = self.biblioteca
+        clave = bib._clave(path)
+        for i in range(bib.count()):
+            it = bib.item(i)
+            if bib._clave(it.data(Qt.ItemDataRole.UserRole)) == clave:
+                if it.isHidden():                       # el filtro de búsqueda lo estaba ocultando
+                    self.ed_filtro.clear()
+                bib.clearSelection()
+                bib.setCurrentItem(it)
+                it.setSelected(True)
+                bib.scrollToItem(it, QAbstractItemView.ScrollHint.PositionAtCenter)
+                self._set_status(f"📍 Ubicado en la lista: {os.path.basename(path)}")
+                return
+        self._set_status("Ese tema no está en la biblioteca")
 
     def _biblioteca_doble_clic(self, it):
         p = it.data(Qt.ItemDataRole.UserRole)
