@@ -1,5 +1,5 @@
 """
-AutoMix Pro — PySide6
+AutoMix — PySide6  (mezclador DJ de dos decks: cruce por bandas, mezcla armónica y por frases, recetas automáticas)
 - Play individual por deck
 - Waveform de cada deck se mueve SOLO si suena
 - 🔗 Sync automático de BPM y downbeats sin tirones
@@ -450,12 +450,13 @@ from PySide6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsLineItem, QGraphicsPolygonItem,
     QGraphicsSimpleTextItem, QFrame, QSplitter, QListWidget, QListWidgetItem,
     QLineEdit, QAbstractItemView, QSpinBox, QDialog, QCheckBox, QSizePolicy,
-    QLayout, QScrollBar, QAbstractScrollArea, QProgressBar, QGridLayout
+    QLayout, QScrollBar, QAbstractScrollArea, QProgressBar, QGridLayout, QGraphicsDropShadowEffect
 )
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QPointF, QMimeData, QUrl, QSize, QRectF
 from PySide6.QtGui import (
     QGuiApplication, QDragEnterEvent, QDropEvent, QColor, QPen, QPainter, QBrush,
-    QPolygonF, QFont, QCursor, QKeyEvent, QShortcut, QKeySequence
+    QPolygonF, QFont, QCursor, QKeyEvent, QShortcut, QKeySequence,
+    QLinearGradient, QRadialGradient, QPainterPath, QFontMetricsF
 )
 
 
@@ -469,6 +470,7 @@ SUPPORTED = (".mp3", ".wav", ".flac", ".ogg", ".m4a")
 
 CF_BAJA_DESDE = 0.75
 TARGET_LUFS_RMS = 0.15
+NIVEL_V2 = 1.35          # V2: más fuerza general (+2,6 dB) sobre el AutoGain; el limitador por ganancia cuida los picos
 
 
 def fmt_time(s):
@@ -836,10 +838,48 @@ def detectar_clave(y, sr):
         return {"camelot": None}
 
 
+VOZ_DT = 0.5          # resolución (s) de las curvas de actividad guardadas en el análisis
+
+
+def analizar_voz(y, sr):
+    """Curvas por tramos de 0,5 s (valores 0..1): `voz` = cuánta voz/melodía hay en los medios (300 Hz–3,4 kHz,
+    solo la parte armónica: sin golpes de caja ni platillos) y `bajo` = cuánta energía hay de bombo/bajo (40–200 Hz).
+    Es una medida de energía, no un reconocedor de voces: una melodía de acordeón o de sintetizador en los medios
+    también cuenta, y eso es justo lo que choca al mezclar."""
+    try:
+        from scipy.ndimage import uniform_filter1d
+        hop = 1024
+        S = np.abs(librosa.stft(y, n_fft=2048, hop_length=hop))
+        H, _P = librosa.decompose.hpss(S, kernel_size=(15, 15))
+        f = librosa.fft_frequencies(sr=sr, n_fft=2048)
+        suav = max(3, int(round(0.9 * sr / hop)))
+        def norm(v):
+            v = uniform_filter1d(v.astype(np.float64), suav)
+            ref = float(np.percentile(v, 95)) or 1.0
+            return np.clip(v / ref, 0.0, 1.0)
+        # Voz/melodía = qué parte de TODA la energía está en los medios armónicos. Se mide contra la energía total (no
+        # contra el propio máximo del tema), así un tema sin voz no se "infla" y uno con voz sí destaca.
+        # VOZ_BAJA/VOZ_ALTA calibran el mapa a 0..1: por debajo de VOZ_BAJA no hay nada, por encima de VOZ_ALTA hay voz plena.
+        VOZ_BAJA, VOZ_ALTA = 0.06, 0.22
+        frac = H[(f >= 300) & (f <= 3400)].sum(axis=0) / (S.sum(axis=0) + 1e-9)
+        voz = np.clip((uniform_filter1d(frac, suav) - VOZ_BAJA) / (VOZ_ALTA - VOZ_BAJA), 0.0, 1.0)
+        bajo = norm(S[(f >= 40) & (f <= 200)].sum(axis=0))
+        t_fr = np.arange(len(voz)) * hop / float(sr)
+        t_g = np.arange(0.0, t_fr[-1] if len(t_fr) else 0.0, VOZ_DT)
+        return {"voz": [round(float(v), 2) for v in np.interp(t_g, t_fr, voz)],
+                "bajo": [round(float(v), 2) for v in np.interp(t_g, t_fr, bajo)],
+                "voz_dt": VOZ_DT}
+    except Exception:
+        import traceback; traceback.print_exc()
+        return {"voz": [], "bajo": [], "voz_dt": VOZ_DT}
+
+
 def _analizar_clave(path):
-    """Solo la tonalidad (para los temas que ya tenían análisis de BPM guardado)."""
+    """Lo que le falte a un análisis viejo (tonalidad y curvas de voz/bajo), sin repetir el BPM. Devuelve un dict."""
     y, sr = librosa.load(path, sr=22050, mono=True)
-    return detectar_clave(y, sr)
+    extras = {"key": detectar_clave(y, sr)}
+    extras.update(analizar_voz(y, sr))
+    return extras
 
 
 def _camelot_tuple(c):
@@ -943,6 +983,7 @@ def _analizar_archivo(path):
         "waveform": rms_small,
         "key": detectar_clave(y, sr),
     }
+    res_out.update(analizar_voz(y, sr))
     if grilla is not None:
         _grilla_final(res_out, grilla)
     else:
@@ -988,6 +1029,12 @@ class Analyzer(QThread):
                         _guardar_cache(cache_key, result)
                         self.done.emit(self.path, result)
                         return
+                if "key" not in data or "voz" not in data:       # caché viejo sin tonalidad / voz: se completa una vez
+                    try:
+                        data.update(analizar_archivo(self.path, solo_clave=True))
+                        _guardar_cache(cache_key, data)
+                    except Exception:
+                        import traceback; traceback.print_exc()
                 self.done.emit(self.path, data)     # caché viejo sin auto_gain: lo calcula el deck del audio ya cargado
                 return
 
@@ -1045,10 +1092,10 @@ class AnalizadorBiblioteca(QThread):
                 else:                                   # análisis viejo sin tonalidad: se completa solo la clave
                     with open(cache_key, encoding="utf-8") as f:
                         data = json.load(f)
-                    if "key" not in data:
-                        data["key"] = analizar_archivo(ruta, solo_clave=True)
+                    if "key" not in data or "voz" not in data:
+                        data.update(analizar_archivo(ruta, solo_clave=True))
                         _guardar_cache(cache_key, data)
-                        print(f"Clave: {os.path.basename(ruta)} -> {data['key'].get('camelot') or '?'}")
+                        print(f"Clave y voz: {os.path.basename(ruta)} -> {(data.get('key') or {}).get('camelot') or '?'}")
             except Exception:
                 import traceback; traceback.print_exc()
             self.tema_listo.emit(ruta)
@@ -1065,6 +1112,189 @@ def load_audio_stereo(path, sr=44100):
 # =====================================================================
 # 3) DECK
 # =====================================================================
+# =====================================================================
+# 0.5) TEMA VISUAL (oscuro, con acentos de neón)
+# =====================================================================
+TEMA = dict(
+    bg0="#06070c", bg1="#0b0e16", bg2="#121726", bg3="#1a2133", linea="#252d44",
+    texto="#e9eeff", suave="#8892b0", cian="#22d3ff", magenta="#ff3d9a", verde="#2cff9a",
+    ambar="#ffb82e", rojo="#ff3b4e", violeta="#8b5cf6",
+)
+COLOR_DECK_A = TEMA["cian"]
+COLOR_DECK_B = TEMA["magenta"]
+
+
+def _rgba(hexcolor, a):
+    c = QColor(hexcolor)
+    return f"rgba({c.red()},{c.green()},{c.blue()},{int(a)})"
+
+
+def aplicar_tema(app):
+    """Estilo Fusion oscuro + hoja de estilo global. No toca tamaños de letra (eso lo maneja la escala de la ventana)."""
+    from PySide6.QtGui import QPalette
+    T = TEMA
+    try:
+        app.setStyle("Fusion")
+    except Exception:
+        pass
+    pal = QPalette()
+    pal.setColor(QPalette.ColorRole.Window, QColor(T["bg0"]))
+    pal.setColor(QPalette.ColorRole.WindowText, QColor(T["texto"]))
+    pal.setColor(QPalette.ColorRole.Base, QColor(T["bg1"]))
+    pal.setColor(QPalette.ColorRole.AlternateBase, QColor("#0e1322"))
+    pal.setColor(QPalette.ColorRole.Text, QColor(T["texto"]))
+    pal.setColor(QPalette.ColorRole.Button, QColor(T["bg3"]))
+    pal.setColor(QPalette.ColorRole.ButtonText, QColor(T["texto"]))
+    pal.setColor(QPalette.ColorRole.Highlight, QColor(T["cian"]))
+    pal.setColor(QPalette.ColorRole.HighlightedText, QColor(T["bg0"]))
+    pal.setColor(QPalette.ColorRole.ToolTipBase, QColor(T["bg2"]))
+    pal.setColor(QPalette.ColorRole.ToolTipText, QColor(T["texto"]))
+    pal.setColor(QPalette.ColorRole.PlaceholderText, QColor("#5b6688"))
+    for rol in (QPalette.ColorRole.Text, QPalette.ColorRole.WindowText, QPalette.ColorRole.ButtonText):
+        pal.setColor(QPalette.ColorGroup.Disabled, rol, QColor("#566082"))
+    app.setPalette(pal)
+    iconos = {}
+    try:                                   # tilde y flechitas como SVG (se escriben una vez en cache/ui)
+        d = Path(__file__).parent / "cache" / "ui"; d.mkdir(parents=True, exist_ok=True)
+        svgs = {
+            "check": '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><path d="M3.6 8.6 L6.8 11.6 L12.6 4.6" fill="none" stroke="#04131c" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+            "arriba": '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><path d="M1 7 L5 2.5 L9 7 Z" fill="#9fb0dd"/></svg>',
+            "abajo": '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><path d="M1 3 L5 7.5 L9 3 Z" fill="#9fb0dd"/></svg>',
+        }
+        for k, v in svgs.items():
+            f = d / f"{k}.svg"
+            if not f.exists() or f.read_text(encoding="utf-8") != v:
+                f.write_text(v, encoding="utf-8")
+            iconos[k] = f.as_posix()
+    except Exception:
+        pass
+    img = lambda k: (f"image:url(\"{iconos[k]}\");" if k in iconos else "")
+    if sys.platform.startswith("win"):
+        f = app.font(); f.setFamily("Segoe UI"); app.setFont(f)
+    app.setStyleSheet(f"""
+QToolTip {{ background:{T['bg2']}; color:{T['texto']}; border:1px solid {T['cian']}; padding:5px; border-radius:4px; }}
+QSplitter::handle {{ background:{T['bg0']}; }}
+QSplitter::handle:hover {{ background:{T['cian']}; }}
+
+QGroupBox {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #141b2d, stop:1 #0d1220);
+            border:1px solid {T['linea']}; border-radius:12px; margin-top:12px; padding-top:6px; }}
+QGroupBox::title {{ subcontrol-origin:margin; subcontrol-position:top left; left:14px; padding:0 8px; color:{T['cian']}; font-weight:bold; }}
+QFrame#panelcruce {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #141b2d, stop:1 #0d1220);
+            border:1px solid {T['linea']}; border-radius:12px; }}
+
+QPushButton {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #2a3452, stop:1 #171d31);
+              border:1px solid #334066; border-radius:9px; padding:4px 10px; color:{T['texto']}; }}
+QPushButton:hover {{ border-color:{T['cian']}; background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #34406a, stop:1 #1c2440); }}
+QPushButton:pressed {{ background:#0b0f1c; border-color:{T['cian']}; padding-top:5px; }}
+QPushButton:checked {{ border-color:{T['ambar']}; background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #4a3a12, stop:1 #2a2108); }}
+QPushButton:disabled {{ color:#566082; background:#101524; border-color:#1d2438; }}
+QPushButton[rol="play"] {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #22d98a, stop:1 #0c9a5e); border:1px solid #5dffb4; color:#032015; }}
+QPushButton[rol="play"]:hover {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #4cf0a6, stop:1 #12b374); }}
+QPushButton[rol="pausa"] {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #3a3320, stop:1 #211c10); border:1px solid #8a7430; color:#ffd36a; }}
+QPushButton[rol="stop"] {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #432030, stop:1 #26111b); border:1px solid #a8344f; color:#ff7a93; }}
+QPushButton[rol="play"]:pressed, QPushButton[rol="pausa"]:pressed, QPushButton[rol="stop"]:pressed {{ background:#0b0f1c; }}
+
+QSlider::groove:horizontal {{ height:6px; background:#080b14; border:1px solid {T['linea']}; border-radius:4px; }}
+QSlider::sub-page:horizontal {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #0f7fa6, stop:1 {T['cian']}); border-radius:4px; }}
+QSlider::add-page:horizontal {{ background:transparent; }}
+QSlider::handle:horizontal {{ width:14px; height:14px; margin:-6px 0; border-radius:8px; border:2px solid {T['cian']};
+            background: qradialgradient(cx:0.5, cy:0.35, radius:0.9, fx:0.5, fy:0.25, stop:0 #ffffff, stop:1 #aebcdc); }}
+QSlider::handle:horizontal:hover {{ border-color:#ffffff; background:#ffffff; }}
+QSlider::sub-page:horizontal:disabled {{ background:#2a3350; }}
+QSlider::handle:horizontal:disabled {{ border-color:#3a4566; background:#59627f; }}
+
+QCheckBox {{ spacing:7px; }}
+QCheckBox::indicator {{ width:16px; height:16px; border-radius:5px; border:1px solid #3d4a73; background:#080b14; }}
+QCheckBox::indicator:hover {{ border-color:{T['cian']}; }}
+QCheckBox::indicator:checked {{ {img('check')} border:1px solid #7be8ff; background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 {T['cian']}, stop:1 #0f7fa6); }}
+
+QLineEdit, QSpinBox {{ background:#080b14; border:1px solid {T['linea']}; border-radius:8px; padding:3px 8px;
+            selection-background-color:{T['cian']}; selection-color:{T['bg0']}; }}
+QLineEdit:focus, QSpinBox:focus {{ border-color:{T['cian']}; }}
+QSpinBox {{ padding-right:20px; }}
+QSpinBox::up-button {{ subcontrol-origin:border; subcontrol-position:top right; width:20px; border:none; border-top-right-radius:7px; background:#161d31; }}
+QSpinBox::down-button {{ subcontrol-origin:border; subcontrol-position:bottom right; width:20px; border:none; border-bottom-right-radius:7px; background:#161d31; }}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background:#26304f; }}
+QSpinBox::up-arrow {{ {img('arriba')} width:10px; height:10px; }}
+QSpinBox::down-arrow {{ {img('abajo')} width:10px; height:10px; }}
+
+QListWidget {{ background:#080b14; border:1px solid {T['linea']}; border-radius:10px; alternate-background-color:#0c111f; outline:0; padding:3px; }}
+QListWidget::item {{ padding:3px 6px; border-radius:5px; }}
+QListWidget::item:selected {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #1d5a7a, stop:1 #16263f); color:#ffffff; }}
+
+QScrollBar:vertical {{ background:transparent; width:10px; margin:2px; }}
+QScrollBar::handle:vertical {{ background:#2a3554; border-radius:4px; min-height:26px; }}
+QScrollBar::handle:vertical:hover {{ background:{T['cian']}; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height:0; }}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background:transparent; }}
+QScrollBar:horizontal {{ background:transparent; height:10px; margin:2px; }}
+QScrollBar::handle:horizontal {{ background:#2a3554; border-radius:4px; min-width:26px; }}
+QScrollBar::handle:horizontal:hover {{ background:{T['cian']}; }}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width:0; }}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{ background:transparent; }}
+QFrame[frameShape="4"] {{ color:{T['linea']}; }}
+""")
+
+
+class LogoAutoMix(QWidget):
+    """Logotipo con un visualizador de graves/medios/agudos que se mueve con el nivel real de la salida."""
+    def __init__(self, fuente_nivel=None):
+        super().__init__()
+        self.fuente_nivel = fuente_nivel
+        self.setMinimumHeight(58); self.setMaximumHeight(58)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._h = [0.1] * 9
+        self._t = 0.0
+        self._timer = QTimer(self); self._timer.timeout.connect(self._animar); self._timer.start(45)
+
+    def _animar(self):
+        try:
+            nivel = float(self.fuente_nivel()) if self.fuente_nivel else 0.0
+        except Exception:
+            nivel = 0.0
+        self._t += 0.045
+        base = max(0.0, min(1.0, nivel * 3.2))
+        for i in range(len(self._h)):
+            ruido = 0.55 + 0.45 * math.sin(self._t * (5.0 + 1.7 * i) + i * 1.3) * math.sin(self._t * 2.3 + i)
+            obj = 0.06 + base * (0.35 + 0.65 * abs(ruido))
+            self._h[i] += (obj - self._h[i]) * (0.55 if obj > self._h[i] else 0.18)
+        self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        # visualizador (si la columna es angosta, menos barras y más finitas)
+        bw, gap = (6.0, 3.0) if w >= 190 else (4.0, 2.0)
+        n = len(self._h) if w >= 150 else 5
+        x0 = 4.0; base = h - 8.0; alto = h - 16.0
+        for i in range(n):
+            v = self._h[i]
+            g = QLinearGradient(0, base - alto, 0, base)
+            g.setColorAt(0.0, QColor(TEMA["magenta"])); g.setColorAt(1.0, QColor(TEMA["cian"]))
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QBrush(g))
+            bh = max(3.0, alto * v)
+            p.drawRoundedRect(QRectF(x0 + i * (bw + gap), base - bh, bw, bh), 2.0, 2.0)
+        # texto: se achica hasta que entre
+        xt = x0 + n * (bw + gap) + 8
+        f = QFont(self.font()); f.setPointSizeF(max(18.0, 24.0 * UI_ESCALA * FUENTE_BOOST)); f.setBold(True); f.setItalic(True)
+        libre = max(20.0, w - xt - 4)
+        for _ in range(30):
+            if QFontMetricsF(f).horizontalAdvance("AutoMix") <= libre or f.pointSizeF() <= 7.0:
+                break
+            f.setPointSizeF(f.pointSizeF() - 1.0)
+        tam = f.pointSizeF()
+        pa = QPainterPath(); pa.addText(xt, h * 0.60, f, "AutoMix")
+        g2 = QLinearGradient(xt, 0, xt + QFontMetricsF(f).horizontalAdvance("AutoMix"), 0)
+        g2.setColorAt(0.0, QColor("#ffffff")); g2.setColorAt(0.5, QColor(TEMA["cian"])); g2.setColorAt(1.0, QColor(TEMA["magenta"]))
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(QBrush(g2)); p.drawPath(pa)
+        if libre > 70:
+            f2 = QFont(self.font()); f2.setPointSizeF(max(6.0, min(7.0 * UI_ESCALA * FUENTE_BOOST, tam * 0.36))); f2.setBold(True)
+            f2.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 3)
+            p.setFont(f2); p.setPen(QColor(TEMA["suave"]))
+            p.drawText(QPointF(xt + 3, h * 0.60 + max(9.0, tam * 0.7)), "DJ  MIXER")
+        p.end()
+
+
 class EtiquetaElidida(QLabel):
     def __init__(self, texto=""):
         super().__init__()
@@ -1115,6 +1345,8 @@ class Deck(QFrame):
         self.cursor = 0
         self._cursor_frac = 0.0
         self.playing = False
+        self.vol_hi = 1.0; self.vol_lo = 1.0      # ganancia de medios+agudos y de graves (la aplica el mezclador, por bandas)
+        self._db_cache = None
         self.volume = 1.0          # volumen de cada deck fijo al 100 %: el nivel se maneja con el crossfader y el volumen general
         self.auto_gain = 1.0
         self.tempo_rate = 1.0
@@ -1125,9 +1357,12 @@ class Deck(QFrame):
         self.original_bpm = None
 
         self.setAcceptDrops(True)
-        self.setStyleSheet(
-            f"Deck {{ background-color: {color}; border: 2px dashed #888; border-radius: 8px; }}"
-        )
+        self._acento = color
+        self.setProperty("cargado", False)
+        self.setStyleSheet(self._qss_deck(color))
+        efecto = QGraphicsDropShadowEffect(self)
+        efecto.setBlurRadius(34); efecto.setOffset(0, 3); efecto.setColor(QColor(_rgba(color, 120)))
+        self.setGraphicsEffect(efecto)
         self.setFixedHeight(150)
 
         lay = QVBoxLayout(self)
@@ -1136,21 +1371,21 @@ class Deck(QFrame):
 
         r1 = QHBoxLayout()
         self.lbl_title = QLabel(f"DECK {name}")
-        self.lbl_title.setStyleSheet("color:white; font-size:15px; font-weight:bold;")
-        self.lbl_title.setFixedWidth(70)
+        self.lbl_title.setStyleSheet(f"color:{color}; font-size:16px; font-weight:bold;")
+        self.lbl_title.setFixedWidth(112)
         r1.addWidget(self.lbl_title)
         self.lbl_track = EtiquetaElidida("Arrastrá una canción aquí")
-        self.lbl_track.setStyleSheet("color:#ddd; font-size:11px;")
+        self.lbl_track.setStyleSheet(f"color:{TEMA['texto']}; font-size:11px;")
         r1.addWidget(self.lbl_track, stretch=1)
         lay.addLayout(r1)
 
         r2 = QHBoxLayout()
         self.lbl_bpm = QLabel("BPM: --")
-        self.lbl_bpm.setStyleSheet("color:#ffd; font-size:11px;")
+        self.lbl_bpm.setStyleSheet(f"color:{TEMA['ambar']}; font-size:11px; font-weight:bold;")
         self.lbl_bpm.setFixedWidth(220)
         r2.addWidget(self.lbl_bpm)
         self.lbl_time = QLabel("00:00 / 00:00")
-        self.lbl_time.setStyleSheet("color:white; font-size:11px;")
+        self.lbl_time.setStyleSheet("color:#ffffff; font-size:12px; font-weight:bold;")
         r2.addWidget(self.lbl_time, stretch=1)
         lay.addLayout(r2)
 
@@ -1165,6 +1400,7 @@ class Deck(QFrame):
                   self.btn_stop, self.btn_reset):
             b.setFixedHeight(38); b.setFixedWidth(58); r3.addWidget(b)
             fb = b.font(); fb.setPointSizeF(17.0); fb.setBold(True); b.setFont(fb)
+        self.btn_play.setProperty("rol", "play"); self.btn_pause.setProperty("rol", "pausa"); self.btn_stop.setProperty("rol", "stop")
         self.btn_load.clicked.connect(self.load_dialog)
         self.btn_play.clicked.connect(self.play)
         self.btn_pause.clicked.connect(self.pause)
@@ -1180,6 +1416,23 @@ class Deck(QFrame):
         lay.addLayout(r3)
 
         self.sld_tempo.valueChanged.connect(self._update_tempo)
+
+    @staticmethod
+    def _qss_deck(color):
+        c = QColor(color); h = max(0, c.hue())
+        f1 = QColor.fromHsv(h, 200, 70).name(); f2 = QColor.fromHsv(h, 180, 28).name()
+        osc = QColor.fromHsv(h, 230, 150).name()
+        return (
+            f"Deck {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 {f1}, stop:0.55 {f2}, stop:1 #070a12);"
+            f" border:1px dashed {_rgba(color, 150)}; border-radius:14px; }}"
+            f"Deck[cargado=\"true\"] {{ border:1px solid {_rgba(color, 230)}; }}"
+            f"Deck QSlider::sub-page:horizontal {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 {osc}, stop:1 {color}); border-radius:4px; }}"
+            f"Deck QSlider::handle:horizontal {{ border:2px solid {color}; }}"
+        )
+
+    def _marcar_cargado(self, v):
+        self.setProperty("cargado", bool(v))
+        self.style().unpolish(self); self.style().polish(self)
 
     def dragEnterEvent(self, e: QDragEnterEvent):
         if e.mimeData().hasUrls():
@@ -1210,6 +1463,7 @@ class Deck(QFrame):
         self.auto_gain = 1.0
         self._ag_listo = False
         self.path = path
+        self._marcar_cargado(True)
         self.lbl_track.setText(os.path.basename(path))
         self.lbl_bpm.setText("⏳ Analizando…")
         self.analyzer = Analyzer(path)
@@ -1380,7 +1634,7 @@ class Deck(QFrame):
             rate = self.rate_eff
             n_audio = len(self.audio)
 
-            ganancia_total = self.volume * self.auto_gain
+            ganancia_total = self.auto_gain * NIVEL_V2   # el volumen (por bandas) lo aplica el mezclador
 
             if abs(rate - 1.0) < 1e-9 and self._cursor_frac == 0.0:
                 end = self.cursor + frames
@@ -1896,7 +2150,79 @@ class AutoMejora:
 # =====================================================================
 # 3.5) MIXER GLOBAL
 # =====================================================================
+class CruceLR4:
+    """Cruce Linkwitz-Riley de 4.º orden estéreo, con estado entre bloques. graves + resto = pasa-todo:
+    con las dos ganancias en 1 el sonido es idéntico al original (sin hueco ni refuerzo)."""
+    def __init__(self, fc, sr):
+        from scipy.signal import butter
+        self.sl = butter(2, fc, "low", fs=sr, output="sos")
+        self.sh = butter(2, fc, "high", fs=sr, output="sos")
+        self.reset()
+
+    def reset(self):
+        n = self.sl.shape[0]
+        self.z = [np.zeros((n, 2, 2)) for _ in range(4)]
+
+    def split(self, x):
+        from scipy.signal import sosfilt
+        l1, self.z[0] = sosfilt(self.sl, x, axis=0, zi=self.z[0])
+        lo, self.z[1] = sosfilt(self.sl, l1, axis=0, zi=self.z[1])
+        h1, self.z[2] = sosfilt(self.sh, x, axis=0, zi=self.z[2])
+        hi, self.z[3] = sosfilt(self.sh, h1, axis=0, zi=self.z[3])
+        return lo.astype(np.float32), hi.astype(np.float32)
+
+
+class LimitadorSuave:
+    """Limitador por GANANCIA (no recorta la onda): baja el volumen de todo el bloque de forma suave justo antes
+    de un pico y lo devuelve despacio. Así los graves fuertes no se deforman (un recorte por muestra sobre un
+    bajo de 50 Hz mete armónicos y suena a 'crunch')."""
+    TECHO = 0.95
+    CHUNK = 32
+    ADELANTO = 3            # trozos de adelanto dentro del bloque (~2 ms): la bajada empieza antes del pico
+    LIBERA_S = 0.120
+
+    def __init__(self, sr=44100):
+        self.sr = sr
+        self.g = 1.0
+        self._sube = self.CHUNK / (self.LIBERA_S * sr)      # cuánto puede subir la ganancia por trozo
+
+    def procesar(self, x):
+        n = x.shape[0]
+        if n == 0:
+            return x
+        C = self.CHUNK
+        k = -(-n // C)
+        pico = np.abs(x).max(axis=1)
+        if k * C != n:
+            pico = np.pad(pico, (0, k * C - n))
+        pico = pico.reshape(k, C).max(axis=1)
+        necesaria = np.minimum(1.0, self.TECHO / np.maximum(pico, 1e-9))
+        if float(necesaria.min()) >= 1.0 and self.g >= 0.9999:
+            self.g = 1.0
+            return x
+        ad = self.ADELANTO
+        pad = np.concatenate([necesaria, np.ones(ad)])
+        obj = pad[0:k].copy()
+        for j in range(1, ad + 1):
+            obj = np.minimum(obj, pad[j:j + k])           # la bajada anticipa el pico
+        gk = np.empty(k)
+        g = self.g
+        for i in range(k):
+            g = obj[i] if obj[i] < g else min(obj[i], g + self._sube)
+            gk[i] = g
+        self.g = g
+        # ganancia por muestra: interpolación entre los centros de los trozos (sin saltos)
+        cen = np.arange(k) * C + C * 0.5
+        gm = np.interp(np.arange(n), cen, gk).astype(np.float32)
+        # la interpolación puede quedar apenas sobre el objetivo entre trozos: se toma el mínimo con el trozo propio
+        gm = np.minimum(gm, np.repeat(obj, C)[:n].astype(np.float32) + 0.02)
+        return x * gm[:, None]
+
+
 class GlobalMixer:
+    F_CRUCE = 150.0           # por debajo = "graves" (bombo y bajo)
+    ESPERA_COMPAS_S = 2.5     # (respaldo) espera máxima de la línea de compás si no se conoce el BPM
+
     def __init__(self, deck_a, deck_b, sr=44100, blocksize=1024):
         self.deck_a = deck_a
         self.deck_b = deck_b
@@ -1912,6 +2238,94 @@ class GlobalMixer:
         self.agudos = TonoAgudos(sr)
         self.mb_activo = False
         self._mb_wet = 0.0
+        self.banda_activa = False         # cruce por bandas (lo enciende la ventana)
+        self._xo_a = CruceLR4(self.F_CRUCE, sr)
+        self._xo_b = CruceLR4(self.F_CRUCE, sr)
+        self._g = None                    # ganancias actuales: a_lo, a_hi, b_lo, b_hi
+        self._swap_espera = 0.0
+        self.limitador = LimitadorSuave(sr)
+
+    @staticmethod
+    def _rampa(g0, g1, frames):
+        if g0 == g1:
+            return g1
+        return np.linspace(g0, g1, frames, dtype=np.float32)[:, None]
+
+    def _db_muestras(self, deck):
+        an = deck.analysis
+        if not an:
+            return None
+        c = deck._db_cache
+        if c is None or c[0] is not an:
+            db = an.get("downbeats_full") or an.get("downbeats") or []
+            arr = np.asarray(db, dtype=np.float64) * float(deck.sr)
+            deck._db_cache = c = (an, arr)
+        return c[1] if len(c[1]) else None
+
+    def _offset_compas(self, deck, p0, frames):
+        """Índice de muestra, dentro de este bloque, donde el deck que sale cruza una línea de compás.
+        None = no cae en este bloque · -1 = no hay grilla (se traspasa ya)."""
+        arr = self._db_muestras(deck)
+        if arr is None:
+            return -1
+        adv = frames * max(1e-6, deck.rate_eff)
+        i = int(np.searchsorted(arr, p0, side="left"))
+        if i < len(arr) and arr[i] < p0 + adv:
+            return int(max(0, min(frames - 1, (arr[i] - p0) / max(1e-6, deck.rate_eff))))
+        return None
+
+    @staticmethod
+    def _vec_paso(g0, g1, k, r, frames):
+        v = np.full(frames, g0, dtype=np.float32)
+        k = max(0, min(k, frames - r))
+        v[k:k + r] = np.linspace(g0, g1, r, endpoint=True, dtype=np.float32)
+        v[k + r:] = g1
+        return v[:, None]
+
+    def _ganancias_bajos(self, tg, frames, pa, pb):
+        g = self._g
+        a0, b0, a1, b1 = g["a_lo"], g["b_lo"], tg["a_lo"], tg["b_lo"]
+        if a0 == a1 and b0 == b1:
+            self._swap_espera = 0.0
+            return a1, b1
+        sale = self.deck_a if a1 < a0 else (self.deck_b if b1 < b0 else None)
+        if sale is None:                                   # los dos suben (p. ej. un deck se detuvo): rampa suave
+            g["a_lo"], g["b_lo"] = a1, b1
+            return self._rampa(a0, a1, frames), self._rampa(b0, b1, frames)
+        p0 = pa if sale is self.deck_a else pb
+        k = self._offset_compas(sale, p0, frames)
+        if k is None:
+            self._swap_espera += frames / float(self.sr)
+            try:
+                compas_s = 4.0 * 60.0 / (float(sale.analysis["bpm"]) * max(1e-6, sale.rate_eff))
+            except Exception:
+                compas_s = self.ESPERA_COMPAS_S
+            if self._swap_espera < compas_s * 1.25:        # un compás entero (y un poco más) siempre contiene una línea
+                return a0, b0                              # todavía no: se espera la próxima línea de compás
+            k = 0
+        self._swap_espera = 0.0
+        r = max(8, min(int(0.020 * self.sr), frames))      # ~20 ms (1 ciclo de un bajo): sin clic ni 'escalón'
+        k = 0 if k < 0 else max(0, k - r)                  # la rampa TERMINA en la línea de compás: el bombo nuevo cae entero
+        g["a_lo"], g["b_lo"] = a1, b1                      # el traspaso queda hecho en este bloque
+        return self._vec_paso(a0, a1, k, r, frames), self._vec_paso(b0, b1, k, r, frames)
+
+    def _mezclar(self, a, b, frames, pa, pb):
+        da, db = self.deck_a, self.deck_b
+        tg = {"a_lo": da.vol_lo, "a_hi": da.vol_hi, "b_lo": db.vol_lo, "b_hi": db.vol_hi}
+        if self._g is None:
+            self._g = dict(tg)
+        g = self._g
+        if self.banda_activa:
+            alo, ahi = self._xo_a.split(a)
+            blo, bhi = self._xo_b.split(b)
+            ga_lo, gb_lo = self._ganancias_bajos(tg, frames, pa, pb)
+            mix = (alo * ga_lo + ahi * self._rampa(g["a_hi"], tg["a_hi"], frames)
+                   + blo * gb_lo + bhi * self._rampa(g["b_hi"], tg["b_hi"], frames))
+        else:
+            mix = a * self._rampa(g["a_hi"], tg["a_hi"], frames) + b * self._rampa(g["b_hi"], tg["b_hi"], frames)
+            g["a_lo"], g["b_lo"] = tg["a_hi"], tg["b_hi"]
+        g["a_hi"], g["b_hi"] = tg["a_hi"], tg["b_hi"]
+        return mix
 
     def start(self):
         if self.stream is not None:
@@ -1930,10 +2344,12 @@ class GlobalMixer:
             self.stream.stop(); self.stream.close(); self.stream = None
 
     def _cb(self, outdata, frames, time_info, status):
+        pa = self.deck_a.cursor + self.deck_a._cursor_frac          # posición al INICIO del bloque (para caer en el compás)
+        pb = self.deck_b.cursor + self.deck_b._cursor_frac
         a = self.deck_a.render(frames)
         b = self.deck_b.render(frames)
         self.snap_pos = (self.deck_a.cursor + self.deck_a._cursor_frac, self.deck_b.cursor + self.deck_b._cursor_frac)
-        mix = a + b
+        mix = self._mezclar(a, b, frames, pa, pb)
         w1 = 1.0 if self.mb_activo else 0.0
         if w1 > 0.0 or self._mb_wet > 0.0:
             try:
@@ -1966,12 +2382,14 @@ class GlobalMixer:
         except Exception:
             self.golpe.cantidad = 0.0
             import traceback; traceback.print_exc()
-        pico = np.abs(mix)
-        if pico.size and float(pico.max()) > 0.9:
-            exceso = np.maximum(pico - 0.9, 0.0)
-            mix = np.where(pico > 0.9,
-                           np.sign(mix) * (0.9 + 0.1 * np.tanh(exceso / 0.1)),
-                           mix)
+        mix = self.limitador.procesar(mix)
+        try:
+            self.nivel_vis = float(np.sqrt(np.mean(mix * mix)))
+        except Exception:
+            self.nivel_vis = 0.0
+        pico = np.abs(mix)                       # red de seguridad (casi nunca actúa): recorte suave solo si algo se escapó
+        if pico.size and float(pico.max()) > 0.98:
+            mix = np.tanh(mix * 1.0).astype(np.float32) if float(pico.max()) > 1.5 else np.clip(mix, -0.99, 0.99)
         g0, g1 = self._gain_act, self.gain_obj
         if g0 != g1:
             mix = mix * np.linspace(g0, g1, frames, dtype=np.float32)[:, None]
@@ -1984,9 +2402,17 @@ class GlobalMixer:
 # =====================================================================
 # 3.7) FORMA DEL CRUCE
 # =====================================================================
-CONFIG_JSON = Path(__file__).parent / "cache" / "config.json"
+CONFIG_JSON = Path(__file__).parent / "cache" / "config_v2.json"      # configuración (incluye la forma del cruce)
+try:
+    _cfg_v1 = Path(__file__).parent / "cache" / "config.json"
+    if not CONFIG_JSON.exists() and _cfg_v1.exists():
+        import shutil as _sh
+        _sh.copyfile(_cfg_v1, CONFIG_JSON)
+except Exception:
+    pass
 DEF_PUNTO_A = 0.50
 DEF_PUNTO_B = 0.0
+DEF_PUNTO_S = 0.5      # por bandas: en qué momento de la mezcla se traspasa el bajo (50 % = a la mitad)
 DEF_MARCA = 0.85      # marca de auto-enganche: SIEMPRE visible (por defecto al 85 % del tema)
 
 
@@ -2002,6 +2428,22 @@ def perfil_cruce_ab(t, punto_a, punto_b):
     else:
         ve = math.sin(min(1.0, (t - punto_b) / (1.0 - punto_b)) * (math.pi / 2))
     return vs, ve
+
+
+def perfil_cruce_bandas(t, punto_a, punto_b, punto_s, rampa=0.12, fin_a=1.0):
+    """Cruce por bandas. Devuelve (sale_medios_agudos, entra_medios_agudos, sale_graves, entra_graves).
+    · El entrante entra a nivel PLENO: en `punto_b` sube de 0 a 100 % en `rampa` de la mezcla (no se queda atenuado).
+    · El que sale conserva sus medios/agudos hasta `punto_a` y ahí se va con un coseno.
+    · El bajo es de uno solo a la vez: el del que sale se traspasa al del que entra en `punto_s` (el mezclador lo
+      hace justo en la línea del compás)."""
+    pa = max(0.0, min(0.97, punto_a)); pb = max(0.0, min(0.97, punto_b)); ps = max(0.0, min(0.97, punto_s))
+    fa = max(pa + 0.03, min(1.0, fin_a))                  # hasta dónde se va el que sale (por defecto, al final)
+    vs = 1.0 if t <= pa else math.cos(min(1.0, (t - pa) / (fa - pa)) * (math.pi / 2))
+    r = max(0.02, min(rampa, 1.0 - pb))
+    ve = 0.0 if t <= pb else math.sin(min(1.0, (t - pb) / r) * (math.pi / 2))
+    lo_s = 1.0 if t < ps else 0.0
+    lo_e = 0.0 if t < ps else 1.0
+    return vs, ve, lo_s, lo_e
 
 
 def leer_config():
@@ -2024,30 +2466,60 @@ class GraficoCruce(QWidget):
     def __init__(self):
         super().__init__()
         self.punto_a = DEF_PUNTO_A; self.punto_b = DEF_PUNTO_B; self.avance = None
+        self.punto_s = DEF_PUNTO_S; self.bandas = False
         self.setMinimumHeight(75)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-    def actualizar(self, pa, pb, avance=None):
+    def actualizar(self, pa, pb, avance=None, ps=None, bandas=False, fa=1.0):
         self.punto_a, self.punto_b, self.avance = pa, pb, avance
+        self.fin_a = fa
+        if ps is not None:
+            self.punto_s = ps
+        self.bandas = bool(bandas)
         self.update()
 
     def paintEvent(self, ev):
         p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h, m = self.width(), self.height(), 6
-        p.fillRect(self.rect(), QColor("#141414"))
-        p.setPen(QPen(QColor("#ffffff"), 2)); p.drawRect(m, m, w - 2 * m - 1, h - 2 * m - 1)
-        x0, x1, yt, yb = m + 2.0, w - m - 2.0, m + 2.0, h - m - 2.0
-        pa, pb = [], []
+        fondo = QLinearGradient(0, 0, 0, h); fondo.setColorAt(0.0, QColor("#0a0e18")); fondo.setColorAt(1.0, QColor("#05070d"))
+        p.setPen(QPen(QColor(TEMA["linea"]), 1)); p.setBrush(QBrush(fondo))
+        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), 8, 8)
+        x0, x1, yt, yb = m + 4.0, w - m - 4.0, m + 4.0, h - m - 4.0
+        p.setPen(QPen(QColor(255, 255, 255, 18), 1))                       # cuadrícula
+        for f in (0.25, 0.5, 0.75):
+            p.drawLine(QPointF(x0 + (x1 - x0) * f, yt), QPointF(x0 + (x1 - x0) * f, yb))
+            p.drawLine(QPointF(x0, yt + (yb - yt) * f), QPointF(x1, yt + (yb - yt) * f))
+        pa, pb, la, lb = [], [], [], []
         for i in range(61):
             t = i / 60
-            vs, ve = perfil_cruce_ab(t, self.punto_a, self.punto_b)
+            if self.bandas:
+                vs, ve, ls, le = perfil_cruce_bandas(t, self.punto_a, self.punto_b, self.punto_s, fin_a=getattr(self, "fin_a", 1.0))
+            else:
+                vs, ve = perfil_cruce_ab(t, self.punto_a, self.punto_b); ls, le = vs, ve
             x = x0 + (x1 - x0) * t
             pa.append(QPointF(x, yb - vs * (yb - yt))); pb.append(QPointF(x, yb - ve * (yb - yt)))
-        p.setPen(QPen(QColor("#e74c3c"), 3)); p.drawPolyline(QPolygonF(pa))
-        p.setPen(QPen(QColor("#3498db"), 3)); p.drawPolyline(QPolygonF(pb))
+            la.append(QPointF(x, yb - ls * (yb - yt) + 3)); lb.append(QPointF(x, yb - le * (yb - yt) + 3))
+        ca, cb = QColor(COLOR_DECK_A), QColor(COLOR_DECK_B)
+
+        def curva(pts, c, relleno=True):
+            if relleno:                                                     # área translucida debajo de la curva
+                poli = QPolygonF(pts + [QPointF(x1, yb), QPointF(x0, yb)])
+                g = QLinearGradient(0, yt, 0, yb); g.setColorAt(0.0, QColor(c.red(), c.green(), c.blue(), 70)); g.setColorAt(1.0, QColor(c.red(), c.green(), c.blue(), 0))
+                p.setPen(Qt.PenStyle.NoPen); p.setBrush(QBrush(g)); p.drawPolygon(poli)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor(c.red(), c.green(), c.blue(), 55), 8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)); p.drawPolyline(QPolygonF(pts))   # resplandor
+            p.setPen(QPen(c, 2.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)); p.drawPolyline(QPolygonF(pts))
+        if self.bandas:                                  # graves: línea punteada, el traspaso se ve como un escalón
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(ca.lighter(150), 2, Qt.PenStyle.DotLine)); p.drawPolyline(QPolygonF(la))
+            p.setPen(QPen(cb.lighter(150), 2, Qt.PenStyle.DotLine)); p.drawPolyline(QPolygonF(lb))
+            xs = x0 + (x1 - x0) * max(0.0, min(1.0, self.punto_s))          # dónde se traspasa el bajo
+            p.setPen(QPen(QColor(TEMA["verde"]), 1, Qt.PenStyle.DashLine)); p.drawLine(QPointF(xs, yt), QPointF(xs, yb))
+        curva(pa, ca); curva(pb, cb)
         if self.avance is not None:
             xa = x0 + (x1 - x0) * max(0.0, min(1.0, self.avance))
-            p.setPen(QPen(QColor("#ffffff"), 1, Qt.PenStyle.DashLine)); p.drawLine(QPointF(xa, yt), QPointF(xa, yb))
+            p.setPen(QPen(QColor(255, 255, 255, 60), 6)); p.drawLine(QPointF(xa, yt), QPointF(xa, yb))
+            p.setPen(QPen(QColor("#ffffff"), 1.5)); p.drawLine(QPointF(xa, yt), QPointF(xa, yb))
         p.end()
 
 
@@ -2055,12 +2527,13 @@ class PanelCruce(QFrame):
     def __init__(self, ventana):
         super().__init__()
         self.v = ventana
-        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setObjectName("panelcruce")
         self.setMinimumWidth(230); self.setMaximumWidth(300)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(3)
-        self.chk = QCheckBox("🎚 Forma de cruce A/B (sin tilde: clásico)")
+        self.chk = QCheckBox("🎚 Forma de cruce A/B")
+        self.chk.setToolTip("Sin tilde: cruce clásico por volumen.")
         self.chk.setChecked(ventana.cruce_ab)
         lay.addWidget(self.chk)
         self.graf = GraficoCruce(); lay.addWidget(self.graf)
@@ -2072,24 +2545,37 @@ class PanelCruce(QFrame):
             lv = QLabel(f"{sl.value()}%"); lv.setMinimumWidth(40); lv.setAlignment(Qt.AlignmentFlag.AlignRight)
             r.addWidget(l); r.addWidget(sl, 1); r.addWidget(lv); lay.addLayout(r)
             return sl, lv
-        self.sl_a, self.lv_a = fila("A (sale):", "#e74c3c", ventana.punto_a, "Momento en que el tema que sale comienza a bajar.")
-        self.sl_b, self.lv_b = fila("B (entra):", "#3498db", ventana.punto_b, "Momento en que el tema que entra comienza a subir.")
+        self.sl_a, self.lv_a = fila("A (sale):", COLOR_DECK_A, ventana.punto_a, "Momento en que el tema que sale comienza a bajar.")
+        self.sl_b, self.lv_b = fila("B (entra):", COLOR_DECK_B, ventana.punto_b, "Momento en que el tema que entra comienza a subir (por bandas: entra a nivel pleno, con una subida corta).")
+        self.chk_bandas = QCheckBox("🎛 Por bandas")
+        self.chk_bandas.setToolTip("Medios y agudos se cruzan con las curvas de arriba; el BAJO (bombo y bajo, <150 Hz) es de uno solo a la vez\ny se traspasa en la línea del compás, sin cortes ni empaste. Sin tilde: el cruce clásico por volumen.")
+        self.chk_bandas.setChecked(ventana.cruce_bandas)
+        lay.addWidget(self.chk_bandas)
+        self.chk_recetas = QCheckBox("🧠 Recetas automáticas")
+        self.chk_recetas.setToolTip("Antes de cada mezcla mira dónde hay voz/melodía en los dos temas y elige la receta:\n· Voz nueva sobre la base vieja\n· Base nueva, voz vieja\n· Entrada instrumental bajo la voz vieja\n· Traspaso instrumental\nSi no hay datos, usa los deslizadores de abajo. (Necesita 'Por bandas'.)")
+        self.chk_recetas.setChecked(ventana.recetas)
+        self.chk_recetas.toggled.connect(ventana.set_recetas)
+        lay.addWidget(self.chk_recetas)
+        self.sl_s, self.lv_s = fila("Bajo (cambia):", TEMA["verde"], ventana.punto_s, "Momento de la mezcla en que el bajo pasa del tema que sale al que entra (en la línea de compás más próxima). 0 % = el nuevo trae su bajo desde el principio · 95 % = el viejo mantiene el bajo casi hasta el final.")
         self.lbl_dur = QLabel(); self.lbl_dur.hide()
         b_def = QPushButton("Valores por defecto"); b_def.clicked.connect(self._defecto)
         lay.addWidget(b_def)
         lay.addStretch()
 
         self.sl_a.valueChanged.connect(self._cambio); self.sl_b.valueChanged.connect(self._cambio)
+        self.sl_s.valueChanged.connect(self._cambio); self.chk_bandas.toggled.connect(self._cambio)
         self.chk.toggled.connect(self._cambio)
         self._timer = QTimer(self); self._timer.timeout.connect(self._refrescar); self._timer.start(50)
-        self.lv_a.setText(f"{self.sl_a.value()}%"); self.lv_b.setText(f"{self.sl_b.value()}%")
+        self.lv_a.setText(f"{self.sl_a.value()}%"); self.lv_b.setText(f"{self.sl_b.value()}%"); self.lv_s.setText(f"{self.sl_s.value()}%")
 
     def _defecto(self):
-        self.sl_a.setValue(int(DEF_PUNTO_A * 100)); self.sl_b.setValue(int(DEF_PUNTO_B * 100))
+        self.sl_a.setValue(int(DEF_PUNTO_A * 100)); self.sl_b.setValue(int(DEF_PUNTO_B * 100)); self.sl_s.setValue(int(DEF_PUNTO_S * 100))
 
     def _cambio(self, *_):
-        self.lv_a.setText(f"{self.sl_a.value()}%"); self.lv_b.setText(f"{self.sl_b.value()}%")
-        self.v.set_forma_cruce(self.sl_a.value() / 100.0, self.sl_b.value() / 100.0, self.chk.isChecked())
+        self.lv_a.setText(f"{self.sl_a.value()}%"); self.lv_b.setText(f"{self.sl_b.value()}%"); self.lv_s.setText(f"{self.sl_s.value()}%")
+        self.sl_s.setEnabled(self.chk_bandas.isChecked())
+        self.v.set_forma_cruce(self.sl_a.value() / 100.0, self.sl_b.value() / 100.0, self.chk.isChecked(),
+                               self.sl_s.value() / 100.0, self.chk_bandas.isChecked())
         self._refrescar()
 
     def _refrescar(self):
@@ -2097,7 +2583,12 @@ class PanelCruce(QFrame):
             return
         x = self.v.crossfader.value() / 100.0
         t = x if self.v._cf_dir == "AB" else 1.0 - x
-        self.graf.actualizar(self.sl_a.value() / 100.0, self.sl_b.value() / 100.0, t)
+        pl = self.v._plan_activo() if hasattr(self.v, "mix_timer") else None
+        if pl:                                           # durante una mezcla con receta, el gráfico muestra la receta
+            self.graf.actualizar(pl["pa"], pl["pb"], t, pl["ps"], True, pl["fa"])
+        else:
+            self.graf.actualizar(self.sl_a.value() / 100.0, self.sl_b.value() / 100.0, t,
+                                 self.sl_s.value() / 100.0, self.chk_bandas.isChecked() and self.chk.isChecked())
         self.lbl_dur.setText(f"⏱ Mezcla: {self.v.spin_mix.value()} s")
 
 
@@ -2156,56 +2647,61 @@ class BarraProgresoConMarca(QWidget):
         w, h = self.width(), self.height()
         m = self.MARGEN
 
-        p.fillRect(self.rect(), QColor("#0d0d0d"))
-
         y_top = 3
-        y_sep = 8
-        p.setPen(QPen(QColor("#3a3a3a"), 1))
+        y_prog_t = 11
+        y_prog_b = h - 5
+        hh = y_prog_b - y_prog_t
+        ancho = w - 2 * m
+        rad = min(8.0, hh / 2.0)
+
+        p.setPen(QPen(QColor(255, 255, 255, 40), 1))                      # reglita de cuartos
         for f in (0.25, 0.5, 0.75):
             x = self._x_de_frac(f)
-            p.drawLine(int(x), y_top, int(x), y_sep)
+            p.drawLine(int(x), y_top, int(x), y_top + 5)
 
-        y_prog_t = 10                 # la barra de progreso ocupa casi todo el fondo negro
-        y_prog_b = h - 4
-        hh = y_prog_b - y_prog_t
-
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(QColor("#1e1e1e")))
-        p.drawRoundedRect(m, y_prog_t, w - 2 * m, hh, 3, 3)
+        fondo = QLinearGradient(0, y_prog_t, 0, y_prog_b)
+        fondo.setColorAt(0.0, QColor("#04060b")); fondo.setColorAt(1.0, QColor("#0d1220"))
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(QBrush(fondo))
+        p.drawRoundedRect(QRectF(m, y_prog_t, ancho, hh), rad, rad)
 
         if self.progreso > 0.0:
-            pw = int(self.progreso * (w - 2 * m))
-            if pw > 0:
-                p.setBrush(QBrush(QColor("#2f9fd0")))
-                p.drawRoundedRect(m, y_prog_t, pw, hh, 3, 3)
+            pw = self.progreso * ancho
+            if pw > 1:
+                g = QLinearGradient(m, 0, m + ancho, 0)
+                g.setColorAt(0.0, QColor("#0f7fa6")); g.setColorAt(0.55, QColor(TEMA["cian"])); g.setColorAt(1.0, QColor(TEMA["violeta"]))
+                p.setBrush(QBrush(g))
+                p.drawRoundedRect(QRectF(m, y_prog_t, pw, hh), rad, rad)
+                brillo = QLinearGradient(0, y_prog_t, 0, y_prog_t + hh)       # reflejo de vidrio
+                brillo.setColorAt(0.0, QColor(255, 255, 255, 80)); brillo.setColorAt(0.5, QColor(255, 255, 255, 10)); brillo.setColorAt(1.0, QColor(0, 0, 0, 40))
+                p.setBrush(QBrush(brillo))
+                p.drawRoundedRect(QRectF(m, y_prog_t, pw, hh), rad, rad)
 
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(QColor("#444"), 1))
-        p.drawRoundedRect(m, y_prog_t, w - 2 * m, hh, 3, 3)
+        p.setPen(QPen(QColor(TEMA["linea"]), 1))
+        p.drawRoundedRect(QRectF(m, y_prog_t, ancho, hh), rad, rad)
 
         if self.dur > 0:
             txt = f"{fmt_time(self.prog_seg)}  /  {fmt_time(self.dur)}"
         else:
             txt = "--:--  /  --:--"
         f = self.font(); f.setPointSizeF(max(12.0, 10.5 * UI_ESCALA * FUENTE_BOOST)); f.setBold(True); p.setFont(f)
-        p.setPen(QPen(QColor("#fff"), 1))
-        p.drawText(m + 6, y_prog_t, w - 2 * m - 12, hh,
-                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, txt)
+        r_txt = QRectF(m + 10, y_prog_t, ancho - 20, hh)
+        p.setPen(QColor(0, 0, 0, 170)); p.drawText(r_txt.translated(1, 1), int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), txt)
+        p.setPen(QColor("#ffffff")); p.drawText(r_txt, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), txt)
 
         if self.marca >= 0:
             txt_m = f"⚓ {self.marca * 100:.1f}%"
-            p.setPen(QPen(QColor("#ff6b6b"), 1))
-            p.drawText(m + 6, y_prog_t, w - 2 * m - 12, hh,
-                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, txt_m)
+            p.setPen(QColor(0, 0, 0, 170)); p.drawText(r_txt.translated(1, 1), int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight), txt_m)
+            p.setPen(QColor(TEMA["rojo"])); p.drawText(r_txt, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight), txt_m)
 
         if self.marca >= 0:                      # la marca va AL FRENTE: se dibuja al final, encima de la barra
             xm = self._x_de_frac(self.marca)
-            p.setPen(QPen(QColor("#000000"), 4))                 # borde oscuro para que se vea sobre lo celeste
-            p.drawLine(int(xm), y_top, int(xm), h - 2)
-            p.setPen(QPen(QColor("#ff3b3b"), 2))
-            p.drawLine(int(xm), y_top, int(xm), h - 2)
-            p.setBrush(QBrush(QColor("#ff3b3b")))
-            p.setPen(QPen(QColor("#000000"), 1))
+            rojo = QColor(TEMA["rojo"])
+            p.setPen(QPen(QColor(rojo.red(), rojo.green(), rojo.blue(), 60), 9, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))   # resplandor
+            p.drawLine(QPointF(xm, y_top + 4), QPointF(xm, h - 4))
+            p.setPen(QPen(QColor(0, 0, 0, 200), 4)); p.drawLine(QPointF(xm, y_top), QPointF(xm, h - 2))
+            p.setPen(QPen(rojo, 2.2)); p.drawLine(QPointF(xm, y_top), QPointF(xm, h - 2))
+            p.setBrush(QBrush(rojo)); p.setPen(QPen(QColor(0, 0, 0, 220), 1))
             p.drawPolygon(QPolygonF([QPointF(xm - 7, y_top - 1), QPointF(xm + 7, y_top - 1), QPointF(xm, y_top + 8)]))
             p.drawPolygon(QPolygonF([QPointF(xm - 7, h - 1), QPointF(xm + 7, h - 1), QPointF(xm, h - 9)]))
 
@@ -2277,6 +2773,7 @@ class Biblioteca(QListWidget):
         self._cola = set()         # temas esperando su análisis (se muestran con ⏳)
         self._memo = {}            # ruta -> (bpm, clave Camelot, nombre de la nota, hay_clave): se lee el .json una sola vez
         self._memo_frase = {}      # ruta -> True si el tema tiene grilla de compases firme (sirve para mezclar en frase)
+        self._memo_voz = {}        # ruta -> True si el análisis ya trae las curvas de voz/bajo
         self._referencia = None    # clave Camelot del tema que suena: los compatibles se pintan de verde
 
     @staticmethod
@@ -2307,7 +2804,7 @@ class Biblioteca(QListWidget):
 
     def quitar_de_cola(self, ruta):
         k = self._clave(ruta)
-        self._memo.pop(k, None); self._memo_frase.pop(k, None)     # terminó su análisis: se vuelve a leer
+        self._memo.pop(k, None); self._memo_frase.pop(k, None); self._memo_voz.pop(k, None)     # terminó su análisis: se vuelve a leer
         self._cola.discard(k)
         self._refrescar_textos()
         self.pintar(*self._ult_pintado) if getattr(self, "_ult_pintado", None) else None
@@ -2317,7 +2814,7 @@ class Biblioteca(QListWidget):
         k = self._clave(ruta)
         v = self._memo.get(k)
         if v is None:
-            bpm = cam = nom = None; hay = False; fr = False
+            bpm = cam = nom = None; hay = False; fr = False; hv = False
             try:
                 cache = CACHE_DIR / (Path(ruta).stem + ".json")
                 if cache.exists():
@@ -2325,6 +2822,7 @@ class Biblioteca(QListWidget):
                         d = json.load(f)
                     b = d.get("bpm"); bpm = float(b) if b is not None else None
                     fr = len(d.get("downbeats_full") or d.get("downbeats") or []) >= 9 and d.get("grid") != 0
+                    hv = "voz" in d
                     if "key" in d:
                         hay = True
                         cam = (d["key"] or {}).get("camelot"); nom = (d["key"] or {}).get("nombre")
@@ -2333,6 +2831,7 @@ class Biblioteca(QListWidget):
             v = (bpm, cam, nom, hay)
             self._memo[k] = v
             self._memo_frase[k] = bool(fr)
+            self._memo_voz[k] = bool(hv)
         return v
 
     def frase_ok(self, ruta):
@@ -2437,15 +2936,15 @@ class Biblioteca(QListWidget):
             ruta = it.data(Qt.ItemDataRole.UserRole)
             k = os.path.normcase(os.path.abspath(ruta))
             if k == ka:
-                it.setBackground(QBrush(QColor("#a8cdf2"))); it.setForeground(QBrush(QColor("#10253f")))
+                it.setBackground(QBrush(QColor("#0c3f57"))); it.setForeground(QBrush(QColor("#8eeaff")))
             elif k == kb:
-                it.setBackground(QBrush(QColor("#f2adc4"))); it.setForeground(QBrush(QColor("#4a0f26")))
+                it.setBackground(QBrush(QColor("#511634"))); it.setForeground(QBrush(QColor("#ff9ccd")))
             else:
                 nivel = compat_armonica(self._referencia, self.info(ruta)[1]) if self._referencia else None
                 if nivel == 2:                      # misma clave o relativa
-                    it.setBackground(QBrush(QColor("#bfe8c4"))); it.setForeground(QBrush(QColor("#0f3d18")))
+                    it.setBackground(QBrush(QColor("#0d4a30"))); it.setForeground(QBrush(QColor("#7dffbf")))
                 elif nivel == 1:                    # vecina en la rueda
-                    it.setBackground(QBrush(QColor("#e6f0c2"))); it.setForeground(QBrush(QColor("#38400f")))
+                    it.setBackground(QBrush(QColor("#3b4410"))); it.setForeground(QBrush(QColor("#e1ff8a")))
                 else:
                     it.setData(Qt.ItemDataRole.BackgroundRole, None)
                     it.setData(Qt.ItemDataRole.ForegroundRole, None)
@@ -2464,7 +2963,7 @@ class Biblioteca(QListWidget):
         out = []
         for r in self.todas():
             bpm, _, _, hay_clave = self.info(r)
-            if bpm is None or not hay_clave:
+            if bpm is None or not hay_clave or not self._memo_voz.get(self._clave(r), False):
                 out.append(r)
         return out
 
@@ -2545,7 +3044,10 @@ class UnifiedTimeline(QGraphicsView):
         self.scene_ = QGraphicsScene()
         self.setScene(self.scene_)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.setStyleSheet("background:#0a0a0a; border:1px solid #333;")
+        self.setStyleSheet(f"border:1px solid {TEMA['linea']}; border-radius:10px;")
+        _fondo = QLinearGradient(0, 0, 0, 1); _fondo.setCoordinateMode(QLinearGradient.CoordinateMode.ObjectBoundingMode)
+        _fondo.setColorAt(0.0, QColor("#05060b")); _fondo.setColorAt(0.5, QColor("#0a0f1b")); _fondo.setColorAt(1.0, QColor("#05060b"))
+        self.setBackgroundBrush(QBrush(_fondo))
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setMinimumHeight(150)
@@ -2608,36 +3110,39 @@ class UnifiedTimeline(QGraphicsView):
                 continue
             x = self.t_to_x(t, W, anchor_a)
             ln = QGraphicsLineItem(x, 0, x, H)
-            ln.setPen(QPen(QColor(45, 45, 45), 1))
+            ln.setPen(QPen(QColor(40, 52, 82, 130), 1))
             self.scene_.addItem(ln)
             txt = QGraphicsSimpleTextItem(fmt_time(t))
-            txt.setBrush(QBrush(QColor(90, 90, 90)))
+            txt.setBrush(QBrush(QColor(110, 128, 170)))
             f = QFont(); f.setPointSizeF(max(9.0, 8 * UI_ESCALA * FUENTE_BOOST)); txt.setFont(f)
             txt.setPos(x + 2, 2)
             self.scene_.addItem(txt)
             t += step_s
 
         cl = QGraphicsLineItem(0, mid, W, mid)
-        cl.setPen(QPen(QColor(60, 60, 60), 1))
+        cl.setPen(QPen(QColor(90, 110, 160, 140), 1))
         self.scene_.addItem(cl)
 
         if self.deck_a.analysis:
             self._draw_deck(self.deck_a.analysis, W, 0, mid - 1, anchor_a,
-                            fill=QColor(0, 120, 200, 200),
-                            beat_c=QColor(0, 220, 255, 120),
-                            kick_c=QColor(255, 255, 255, 230),
-                            downbeat_c=QColor(0, 255, 120, 220))
+                            fill=QColor(34, 211, 255, 235),
+                            beat_c=QColor(120, 230, 255, 70),
+                            kick_c=QColor(255, 255, 255, 150),
+                            downbeat_c=QColor(44, 255, 154, 200), core=QColor(10, 92, 140, 215))
 
         if self.deck_b.analysis:
             self._draw_deck(self.deck_b.analysis, W, mid + 1, H, anchor_b,
-                            fill=QColor(200, 60, 140, 200),
-                            beat_c=QColor(255, 120, 200, 120),
-                            kick_c=QColor(255, 255, 255, 230),
-                            downbeat_c=QColor(255, 200, 0, 220))
+                            fill=QColor(255, 61, 154, 235),
+                            beat_c=QColor(255, 150, 210, 70),
+                            kick_c=QColor(255, 255, 255, 150),
+                            downbeat_c=QColor(255, 184, 46, 210), core=QColor(130, 24, 90, 215))
 
         center_x = W / 2.0
+        for ancho_ph, alfa_ph in ((10, 28), (5, 70)):                       # resplandor del playhead
+            gl = QGraphicsLineItem(center_x, 0, center_x, H)
+            gl.setPen(QPen(QColor(255, 240, 170, alfa_ph), ancho_ph)); self.scene_.addItem(gl)
         ph = QGraphicsLineItem(center_x, 0, center_x, H)
-        ph.setPen(QPen(QColor(255, 255, 0), 2))
+        ph.setPen(QPen(QColor(255, 250, 220), 2))
         self.scene_.addItem(ph)
 
         if self.manito_active:
@@ -2646,7 +3151,7 @@ class UnifiedTimeline(QGraphicsView):
             self.viewport().setCursor(QCursor(Qt.CursorShape.ArrowCursor))
 
     def _draw_deck(self, analysis, W, top, bottom, anchor,
-                   fill, beat_c, kick_c, downbeat_c):
+                   fill, beat_c, kick_c, downbeat_c, core=None):
         wf = analysis["waveform"]
         if not wf:
             return
@@ -2677,8 +3182,13 @@ class UnifiedTimeline(QGraphicsView):
                 vn = (v / maxv) * amp
                 poly.append(QPointF(x, center_y + vn))
             item = QGraphicsPolygonItem(poly)
-            item.setBrush(QBrush(fill))
-            item.setPen(QPen(fill.darker(150), 0.5))
+            if core is not None:                                           # picos brillantes, centro más profundo
+                gr = QLinearGradient(0, top, 0, bottom)
+                gr.setColorAt(0.0, fill); gr.setColorAt(0.5, core); gr.setColorAt(1.0, fill)
+                item.setBrush(QBrush(gr))
+            else:
+                item.setBrush(QBrush(fill))
+            item.setPen(QPen(fill.lighter(125), 0.6))
             self.scene_.addItem(item)
 
         for b in analysis.get("beats", []):
@@ -2692,14 +3202,14 @@ class UnifiedTimeline(QGraphicsView):
             x = self.t_to_x(d, W, anchor)
             if x < -2 or x > W + 2: continue
             ln = QGraphicsLineItem(x, top, x, bottom)
-            ln.setPen(QPen(downbeat_c, 3))
+            ln.setPen(QPen(downbeat_c, 2))
             self.scene_.addItem(ln)
 
         for k in analysis.get("kicks", []):
             x = self.t_to_x(k, W, anchor)
             if x < -2 or x > W + 2: continue
             ln = QGraphicsLineItem(x, top, x, bottom)
-            ln.setPen(QPen(kick_c, 2))
+            ln.setPen(QPen(kick_c, 1.4))
             self.scene_.addItem(ln)
 
     def mousePressEvent(self, event):
@@ -2940,10 +3450,18 @@ class SmartSync:
 class AutoMix(QMainWindow):
     def __init__(self):
         super().__init__()
+        try:
+            aplicar_tema(QApplication.instance())
+        except Exception:
+            import traceback; traceback.print_exc()
         cfg = leer_config()
         self.punto_a = float(cfg.get("punto_a", DEF_PUNTO_A))
         self.punto_b = float(cfg.get("punto_b", DEF_PUNTO_B))
         self.cruce_ab = bool(cfg.get("cruce_ab", True))
+        self.punto_s = float(cfg.get("punto_s", DEF_PUNTO_S))
+        self.cruce_bandas = bool(cfg.get("cruce_bandas", True))
+        self.recetas = bool(cfg.get("recetas", True))
+        self._plan = None                 # receta de la mezcla en curso: dict(pa, pb, ps, fa, nombre) o None
         self._cf_dir = "AB"
         self.carga_auto = True
         self.auto_s = int(cfg.get("auto_s", 30))
@@ -2956,7 +3474,7 @@ class AutoMix(QMainWindow):
         self._marca_disparada = False
         self._ultimo_prog_primario = 0.0
         self._ultimo_deck_primario = None
-        self.setWindowTitle("AutoMix Pro 🎚️")
+        self.setWindowTitle("AutoMix 🎚️")
         self.resize(1560, 850)
 
         split = QSplitter(Qt.Orientation.Horizontal)
@@ -2967,7 +3485,10 @@ class AutoMix(QMainWindow):
         lib_lay = QVBoxLayout(panel_lib)
         lib_lay.setContentsMargins(8, 8, 0, 8)
         lib_lay.setSpacing(4)
+        self.logo = LogoAutoMix(lambda: getattr(getattr(self, "mixer", None), "nivel_vis", 0.0))
+        lib_lay.addWidget(self.logo)
         self.lbl_lib = EtiquetaElidida("📁 Biblioteca — arrastrá carpetas acá")
+        self.lbl_lib.setStyleSheet(f"color:{TEMA['suave']}; font-weight:bold;")
         lib_lay.addWidget(self.lbl_lib)
         self.ed_filtro = QLineEdit()
         self.ed_filtro.setPlaceholderText("Buscar…")
@@ -3014,8 +3535,9 @@ class AutoMix(QMainWindow):
         root.setSpacing(6)
 
         decks_row = QHBoxLayout()
-        self.deck_a = Deck("A", "#1e3a5f", self._on_analysis)
-        self.deck_b = Deck("B", "#5f1e3a", self._on_analysis)
+        decks_row.setSpacing(14)
+        self.deck_a = Deck("A", COLOR_DECK_A, self._on_analysis)
+        self.deck_b = Deck("B", COLOR_DECK_B, self._on_analysis)
         self.deck_a.on_play_cb = self._auto_sync
         self.deck_b.on_play_cb = self._auto_sync
         # Callback para que el botón reset avise a la ventana y se redibuje el timeline
@@ -3113,7 +3635,7 @@ class AutoMix(QMainWindow):
         bl.addWidget(self.barra_prog, stretch=1)
         self.lbl_marca = QLabel()
         self.lbl_marca.setMinimumWidth(190)
-        self.lbl_marca.setStyleSheet("color:#bbb; font-size:11px;")
+        self.lbl_marca.setStyleSheet(f"color:{TEMA['suave']}; font-size:11px;")
         self._actualizar_lbl_marca()
         bl.addWidget(self.lbl_marca)
         root.addWidget(barra_box)
@@ -3208,8 +3730,8 @@ class AutoMix(QMainWindow):
         g.setContentsMargins(8, 6, 8, 4)
         g.setVerticalSpacing(3)
         g.setHorizontalSpacing(8)
-        naranja = "font-weight: bold; color: #f2a33a;"
-        suave = "color: #888;"
+        naranja = f"font-weight: bold; color: {TEMA['ambar']};"
+        suave = f"color: {TEMA['suave']};"
 
         fila = QHBoxLayout()
         self.chk_mb = QCheckBox("Automática (recomendado)")
@@ -3243,7 +3765,8 @@ class AutoMix(QMainWindow):
             g.addWidget(e, 1, 1 + 2 * j, 1, 2)
         self.mb_medidores = []
         for i, banda in enumerate(("Graves", "Medios", "Agudos")):
-            cab = QLabel(banda); cab.setStyleSheet(naranja); cab.setMinimumWidth(48)
+            col_banda = {"Graves": TEMA["magenta"], "Medios": TEMA["ambar"], "Agudos": TEMA["cian"]}[banda]
+            cab = QLabel(banda); cab.setStyleSheet(f"font-weight: bold; color: {col_banda};"); cab.setMinimumWidth(48)
             g.addWidget(cab, 2 + i, 0)
             fila_m = []
             for j, (nombre, mn, mx, fmt, tip) in enumerate(columnas):
@@ -3251,6 +3774,7 @@ class AutoMix(QMainWindow):
                 sl.setRange(mn, mx); sl.setValue(mn); sl.setMinimumWidth(50)
                 sl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
                 sl.setFocusPolicy(Qt.FocusPolicy.NoFocus); sl.setToolTip(tip)
+                sl.setStyleSheet(f"QSlider::sub-page:horizontal {{ background: {col_banda}; border-radius:4px; }} QSlider::handle:horizontal {{ border-color: {col_banda}; }}")
                 lbl = QLabel(fmt(sl.value())); lbl.setStyleSheet(suave); lbl.setMinimumWidth(48)
                 sl.valueChanged.connect(lambda v, l=lbl, f=fmt: l.setText(f(v)))
                 g.addWidget(sl, 2 + i, 1 + 2 * j); g.addWidget(lbl, 2 + i, 2 + 2 * j)
@@ -3293,11 +3817,15 @@ class AutoMix(QMainWindow):
         # Mezclar / Duración / Volumen general: a la derecha de los deslizadores (más compacto)
         der = QVBoxLayout(); der.setSpacing(6)
         self.btn_mix.setFixedHeight(34)
+        self.btn_mix.setFixedHeight(38)
         self.btn_mix.setStyleSheet(
-            "QPushButton { background:#f5c518; color:#222; font-weight:bold; border:1px solid #b8900a; border-radius:5px; }"
-            "QPushButton:hover { background:#ffd83a; }"
-            "QPushButton:pressed { background:#d9a800; }"
-            "QPushButton:disabled { background:#cfc08a; color:#777; }")
+            "QPushButton { background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #ffd84a, stop:1 #ff9a00); color:#2a1700; font-weight:bold;"
+            " border:1px solid #ffe08a; border-radius:11px; }"
+            "QPushButton:hover { background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #ffe473, stop:1 #ffae2e); }"
+            "QPushButton:pressed { background:#d98400; padding-top:2px; }"
+            "QPushButton:disabled { background:#3a3322; color:#7a7155; border-color:#4a422c; }")
+        _glow = QGraphicsDropShadowEffect(self.btn_mix); _glow.setBlurRadius(26); _glow.setOffset(0, 2); _glow.setColor(QColor(255, 160, 0, 130))
+        self.btn_mix.setGraphicsEffect(_glow)
         der.addWidget(self.btn_mix)
         self.spin_mix.setFixedWidth(58)           # corto: solo el número
         f_dur = QHBoxLayout(); f_dur.addWidget(self.lbl_dur); f_dur.addWidget(self.spin_mix)
@@ -3403,9 +3931,91 @@ class AutoMix(QMainWindow):
         self.btn_mix.setText(f"🎬 Mezclar ({v}s) [F2]")
         guardar_config(mezcla_s=int(v))
 
-    def set_forma_cruce(self, pa, pb, activo):
+    # ================= RECETAS DE MEZCLA (según dónde hay voz/melodía) =================
+    UMBRAL_VOZ = 0.45
+
+    def _plan_activo(self):
+        pl = getattr(self, "_plan", None)
+        if pl and (self.mix_timer.isActive() or self.mix_pausa_timer.isActive()):
+            return pl
+        return None
+
+    @staticmethod
+    def _x_de_tiempo(T, dur):
+        """Fracción de la mezcla (posición del crossfader) a los T segundos de empezar, contando la pausa de 3 s al 50 %."""
+        mitad = dur / 2.0
+        if T <= mitad:
+            return T / dur
+        if T <= mitad + 3.0:
+            return 0.5
+        return min(1.0, (T - 3.0) / dur)
+
+    def _actividad(self, deck, dur_total):
+        """Lista (cada 0,5 s reales desde ahora) de True/False: ¿hay voz/melodía en los medios de ese deck?"""
+        an = deck.analysis or {}
+        voz = an.get("voz") or []
+        if not voz:
+            return None
+        dt = float(an.get("voz_dt", 0.5))
+        pos = deck.position_seconds(); rate = max(1e-6, deck.rate_eff)
+        out = []
+        for i in range(int(dur_total / 0.5) + 1):
+            k = int((pos + i * 0.5 * rate) / dt)
+            out.append(bool(k < len(voz) and voz[k] >= self.UMBRAL_VOZ))
+        return out
+
+    def _planificar_mezcla(self, sale, entra, dur):
+        """Elige la receta de esta mezcla mirando dónde hay voz/melodía en el tema que sale y en el que entra.
+        Devuelve dict(pa, pb, ps, fa, nombre) o None (se usan los deslizadores del panel)."""
+        W = dur + 3.0
+        act_s, act_e = self._actividad(sale, W), self._actividad(entra, W)
+        if act_s is None or act_e is None:
+            return None
+        n = len(act_s)
+        def primer_silencio(a):                         # primer instante con 2 s sin actividad (0 = ya está sin actividad)
+            for i in range(n):
+                if not any(a[i:i + 4]):
+                    return i * 0.5
+            return None
+        def primera_actividad(a):
+            for i in range(n):
+                if a[i]:
+                    return i * 0.5
+            return None
+        fin_s = primer_silencio(act_s)                  # None = el que sale tiene voz durante toda la mezcla
+        ini_e = primera_actividad(act_e)                # None = el que entra es instrumental durante toda la mezcla
+        sale_activo = fin_s != 0.0
+        entra_pronto = ini_e is not None and ini_e <= 0.3 * dur
+        x = lambda T: self._x_de_tiempo(T, dur)
+        pa, pb, ps, fa = self.punto_a, self.punto_b, self.punto_s, 1.0
+        if not sale_activo:
+            if ini_e is not None:
+                nombre = "Voz nueva sobre la base vieja"
+                pb, pa, ps = 0.0, 0.75, 0.8             # entra todo ya; el bajo viejo sigue casi hasta el final
+            else:
+                nombre = "Traspaso instrumental"
+        elif entra_pronto:
+            nombre = "Base nueva, voz vieja"
+            ps = 0.15                                    # el bajo/bombo nuevo entra enseguida (en el compás)…
+            pb = min(0.8, x(fin_s)) if fin_s is not None else 0.6   # …y su voz espera a que termine la del que sale
+            pa, fa = max(0.2, pb - 0.2), min(1.0, pb + 0.1)
+        else:
+            nombre = "Entrada instrumental bajo la voz vieja"
+            pb, ps, pa = 0.0, 0.3, 0.65                  # el nuevo entra completo; la voz vieja sigue un rato
+        return {"pa": float(pa), "pb": float(pb), "ps": float(ps), "fa": float(fa), "nombre": nombre}
+
+    def set_recetas(self, v):
+        self.recetas = bool(v)
+        guardar_config(recetas=self.recetas)
+
+    def set_forma_cruce(self, pa, pb, activo, ps=None, bandas=None):
         self.punto_a, self.punto_b, self.cruce_ab = float(pa), float(pb), bool(activo)
-        guardar_config(punto_a=self.punto_a, punto_b=self.punto_b, cruce_ab=self.cruce_ab)
+        if ps is not None:
+            self.punto_s = float(ps)
+        if bandas is not None:
+            self.cruce_bandas = bool(bandas)
+        guardar_config(punto_a=self.punto_a, punto_b=self.punto_b, cruce_ab=self.cruce_ab,
+                       punto_s=self.punto_s, cruce_bandas=self.cruce_bandas)
         self._update_cf()
 
     def _auto_s_cambio(self, v):
@@ -3947,17 +4557,35 @@ class AutoMix(QMainWindow):
         if fader_val == 0: self._cf_dir = "AB"
         elif fader_val == 100: self._cf_dir = "BA"
 
-        if self.cruce_ab:
+        bandas = bool(self.cruce_ab and self.cruce_bandas)
+        if bandas:
             t = x if self._cf_dir == "AB" else 1.0 - x
-            v_sale, v_entra = perfil_cruce_ab(t, self.punto_a, self.punto_b)
-            gan_a, gan_b = (v_sale, v_entra) if self._cf_dir == "AB" else (v_entra, v_sale)
+            pl = self._plan_activo()
+            if pl:
+                vs_h, ve_h, vs_l, ve_l = perfil_cruce_bandas(t, pl["pa"], pl["pb"], pl["ps"], fin_a=pl["fa"])
+            else:
+                vs_h, ve_h, vs_l, ve_l = perfil_cruce_bandas(t, self.punto_a, self.punto_b, self.punto_s)
+            if self._cf_dir == "AB":
+                hi_a, hi_b, lo_a, lo_b = vs_h, ve_h, vs_l, ve_l
+            else:
+                hi_a, hi_b, lo_a, lo_b = ve_h, vs_h, ve_l, vs_l
         else:
-            tramo = max(1e-6, 1.0 - CF_BAJA_DESDE)
-            gan_a = min(1.0, max(0.0, (1.0 - x) / tramo))
-            gan_b = min(1.0, max(0.0, x / tramo))
+            if self.cruce_ab:
+                t = x if self._cf_dir == "AB" else 1.0 - x
+                v_sale, v_entra = perfil_cruce_ab(t, self.punto_a, self.punto_b)
+                gan_a, gan_b = (v_sale, v_entra) if self._cf_dir == "AB" else (v_entra, v_sale)
+            else:
+                tramo = max(1e-6, 1.0 - CF_BAJA_DESDE)
+                gan_a = min(1.0, max(0.0, (1.0 - x) / tramo))
+                gan_b = min(1.0, max(0.0, x / tramo))
+            hi_a = lo_a = gan_a
+            hi_b = lo_b = gan_b
 
-        self.deck_a.volume = gan_a
-        self.deck_b.volume = gan_b
+        self.deck_a.vol_hi, self.deck_a.vol_lo = hi_a, lo_a
+        self.deck_b.vol_hi, self.deck_b.vol_lo = hi_b, lo_b
+        self.deck_a.volume = max(hi_a, lo_a)
+        self.deck_b.volume = max(hi_b, lo_b)
+        self.mixer.banda_activa = bandas
 
         self._apply_shared_bpm(x)
 
@@ -4216,13 +4844,24 @@ class AutoMix(QMainWindow):
         self._mix_pausa_hecha = False
         self.mix_pausa_timer.stop()
 
+        self._plan = None
+        if self.recetas and self.cruce_ab and self.cruce_bandas:
+            try:
+                self._plan = self._planificar_mezcla(sale_d, entra, duration_s)
+            except Exception:
+                import traceback; traceback.print_exc()
+                self._plan = None
+        if self._plan:
+            pl = self._plan
+            print(f"[receta] {pl['nombre']} · sale desde {pl['pa']:.0%}, entra desde {pl['pb']:.0%}, bajo en {pl['ps']:.0%}")
         self.mix_timer.start(interval_ms)
-        self._set_status(f"🎬 Mezclando {direction} en {int(duration_s)} s...")
+        self._set_status(f"🎬 Mezclando {direction} en {int(duration_s)} s..." + (f"  🧠 {self._plan['nombre']}" if self._plan else ""))
 
     def _mix_step(self):
         if self.mix_steps_done >= self.mix_steps_total:
             self.mix_timer.stop()
             self.crossfader.setValue(self.mix_to)
+            self._plan = None
             self._set_status("🎬 Mezcla completada")
             return
 
