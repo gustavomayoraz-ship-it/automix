@@ -2538,10 +2538,10 @@ try:
         _sh.copyfile(_cfg_v1, CONFIG_JSON)
 except Exception:
     pass
-DEF_PUNTO_A = 0.50
-DEF_PUNTO_B = 0.0
+DEF_PUNTO_A = 0.0      # valores por defecto de la forma de cruce
+DEF_PUNTO_B = 0.15
 DEF_PUNTO_S = 0.5      # por bandas: en qué momento de la mezcla se traspasa el bajo (50 % = a la mitad)
-DEF_MARCA = 0.85      # marca de auto-enganche: SIEMPRE visible (por defecto al 85 % del tema)
+DEF_MARCA = 0.50      # marca de auto-enganche: SIEMPRE visible (por defecto a la mitad del tema)
 
 
 def perfil_cruce_ab(t, punto_a, punto_b):
@@ -2702,7 +2702,16 @@ class PanelCruce(QFrame):
         self.lv_a.setText(f"{self.sl_a.value()}%"); self.lv_b.setText(f"{self.sl_b.value()}%"); self.lv_s.setText(f"{self.sl_s.value()}%")
 
     def _defecto(self):
-        self.sl_a.setValue(int(DEF_PUNTO_A * 100)); self.sl_b.setValue(int(DEF_PUNTO_B * 100)); self.sl_s.setValue(int(DEF_PUNTO_S * 100))
+        self.sl_a.setValue(int(round(DEF_PUNTO_A * 100))); self.sl_b.setValue(int(round(DEF_PUNTO_B * 100))); self.sl_s.setValue(int(round(DEF_PUNTO_S * 100)))
+        self.chk.setChecked(True)               # forma de cruce A/B activada
+        self.chk_bandas.setChecked(True)        # por bandas
+        self.chk_recetas.setChecked(False)      # recetas automáticas apagadas
+        self.chk_comp.setChecked(True)          # compensar nivel
+        try:                                    # marca del auto-enganche al 50 %
+            self.v.barra_prog.set_marca(DEF_MARCA)
+            self.v._marca_cambiada(DEF_MARCA)
+        except Exception:
+            import traceback; traceback.print_exc()
 
     def _cambio(self, *_):
         self.lv_a.setText(f"{self.sl_a.value()}%"); self.lv_b.setText(f"{self.sl_b.value()}%"); self.lv_s.setText(f"{self.sl_s.value()}%")
@@ -3593,7 +3602,7 @@ class AutoMix(QMainWindow):
         self.cruce_ab = bool(cfg.get("cruce_ab", True))
         self.punto_s = float(cfg.get("punto_s", DEF_PUNTO_S))
         self.cruce_bandas = bool(cfg.get("cruce_bandas", True))
-        self.recetas = bool(cfg.get("recetas", True))
+        self.recetas = bool(cfg.get("recetas", False))
         self.comp_nivel = bool(cfg.get("comp_nivel", True))
         self._plan = None                 # receta de la mezcla en curso: dict(pa, pb, ps, fa, nombre) o None
         self._cf_dir = "AB"
@@ -4621,10 +4630,27 @@ class AutoMix(QMainWindow):
     def _biblioteca_doble_clic(self, it):
         p = it.data(Qt.ItemDataRole.UserRole)
         if not os.path.isfile(p): return
-        if self.deck_a.playing and self.deck_b.playing:
+        a, b = self.deck_a, self.deck_b
+        if a.playing and b.playing:
             self._set_status("Los dos decks están sonando.")
             return
-        (self.deck_b if self.deck_a.playing else self.deck_a).load_track(p)
+        if not a.playing and not b.playing:
+            # no suena nada: el tema elegido va al deck A y el que le sigue (según la lista / el modo armónico) al B
+            a.load_track(p)
+            try:
+                ruta, motivo = self._siguiente_en_biblioteca(p)
+            except Exception:
+                import traceback; traceback.print_exc()
+                ruta, motivo = None, "no se pudo elegir el siguiente"
+            if ruta is not None and os.path.normcase(os.path.abspath(ruta)) != os.path.normcase(os.path.abspath(p)):
+                b.load_track(ruta)
+                k0, k1 = self._clave_de(a), self.biblioteca.info(ruta)[1]
+                extra = f"  🎼 {k0}→{k1}" if (k0 and k1) else ""
+                self._set_status(f"▶ Deck A: {os.path.basename(p)} · Deck B en espera: {os.path.basename(ruta)}{extra}")
+            else:
+                self._set_status(f"▶ Deck A: {os.path.basename(p)} · Deck B: {motivo or 'sin tema siguiente'}")
+            return
+        (b if a.playing else a).load_track(p)      # suena uno: el elegido va al deck que está en espera
 
     def _alternar_consola(self):
         visible = CONSOLA.alternar()
