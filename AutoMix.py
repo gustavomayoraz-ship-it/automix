@@ -593,7 +593,7 @@ def _cerrar_pool():
             pass
 
 
-def analizar_archivo(path):
+def analizar_archivo(path, solo_clave=False):
     """El análisis (librosa/numba) retiene el GIL por momentos y trababa el audio ('rrrr').
     Se hace en un proceso aparte; si eso falla o se cuelga, se hace acá como antes."""
     global _POOL, _POOL_BLOQ_HASTA, _POOL_USOS
@@ -608,7 +608,7 @@ def analizar_archivo(path):
                     if os.name == "nt" and pw.exists():
                         ctx.set_executable(str(pw))
                     _POOL = ProcessPoolExecutor(max_workers=1, mp_context=ctx)
-                res = _POOL.submit(_analizar_archivo, path).result(timeout=TIMEOUT_ANALISIS)
+                res = _POOL.submit(_analizar_clave if solo_clave else _analizar_archivo, path).result(timeout=TIMEOUT_ANALISIS)
                 _POOL_USOS += 1
                 if _POOL_USOS >= POOL_RENOVAR_CADA:
                     _POOL_USOS = 0
@@ -622,7 +622,7 @@ def analizar_archivo(path):
                 if isinstance(e, (_TO, BrokenProcessPool, OSError)):
                     _POOL_BLOQ_HASTA = time.monotonic() + 600.0
                     print(f"[análisis] el proceso aparte falló ({type(e).__name__}); se analiza en el programa durante unos minutos")
-        return _analizar_archivo(path)
+        return _analizar_clave(path) if solo_clave else _analizar_archivo(path)
 
 
 def _pista_bpm(path):
@@ -796,6 +796,71 @@ def _limpiar_grilla_cache(res):
         return False
 
 
+# ---------- Tonalidad (rueda de Camelot) ----------
+_PERFIL_MAYOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+_PERFIL_MENOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+_NOTAS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+
+def camelot_de(tonica, menor):
+    """Nota (0=C … 11=B) y modo → código de la rueda de Camelot (ej. 8B = Do mayor, 8A = La menor)."""
+    rel = (int(tonica) + 3) % 12 if menor else int(tonica)        # el menor comparte número con su relativo mayor
+    num = ((rel * 7 + 8 - 1) % 12) + 1
+    return f"{num}{'A' if menor else 'B'}"
+
+
+def detectar_clave(y, sr):
+    """Tonalidad por cromagrama + perfiles de Krumhansl. Devuelve dict con camelot (o None si no hay tono claro)."""
+    try:
+        if len(y) < sr * 5:
+            return {"camelot": None}
+        # el tramo central representa mejor al tema que la intro/outro; se acota para no tardar
+        mid = len(y) // 2
+        tramo = y[max(0, mid - sr * 45): mid + sr * 45]
+        chroma = librosa.feature.chroma_stft(y=tramo, sr=sr, n_fft=4096, hop_length=2048)
+        v = np.mean(chroma, axis=1)
+        if not np.all(np.isfinite(v)) or float(np.sum(v)) <= 1e-9:
+            return {"camelot": None}
+        v = v / np.linalg.norm(v)
+        mejores = []
+        for modo, perfil in ((0, _PERFIL_MAYOR), (1, _PERFIL_MENOR)):
+            for t in range(12):
+                r = float(np.corrcoef(v, np.roll(perfil, t))[0, 1])
+                mejores.append((r, t, modo))
+        mejores.sort(reverse=True)
+        r1, t1, m1 = mejores[0]
+        r2 = mejores[1][0]
+        return {"camelot": camelot_de(t1, bool(m1)), "tonica": int(t1), "menor": bool(m1),
+                "nombre": _NOTAS[t1] + ("m" if m1 else ""), "conf": round(float(r1 - r2), 3)}
+    except Exception:
+        return {"camelot": None}
+
+
+def _analizar_clave(path):
+    """Solo la tonalidad (para los temas que ya tenían análisis de BPM guardado)."""
+    y, sr = librosa.load(path, sr=22050, mono=True)
+    return detectar_clave(y, sr)
+
+
+def _camelot_tuple(c):
+    try:
+        return int(c[:-1]), c[-1].upper()
+    except Exception:
+        return None
+
+
+def compat_armonica(c1, c2):
+    """2 = misma clave o relativa (suenan perfecto juntas) · 1 = vecina en la rueda (±1) · 0 = chocan · None = sin dato."""
+    a, b = _camelot_tuple(c1) if c1 else None, _camelot_tuple(c2) if c2 else None
+    if not a or not b:
+        return None
+    if a[0] == b[0]:
+        return 2
+    if a[1] == b[1] and (abs(a[0] - b[0]) % 12 in (1, 11)):
+        return 1
+    return 0
+
+
 def _analizar_archivo(path):
     y, sr = librosa.load(path, sr=22050, mono=True)
 
@@ -876,6 +941,7 @@ def _analizar_archivo(path):
         "downbeats_full": [float(d) for d in downbeats],
         "kicks_full": [float(k) for k in kicks],
         "waveform": rms_small,
+        "key": detectar_clave(y, sr),
     }
     if grilla is not None:
         _grilla_final(res_out, grilla)
@@ -972,9 +1038,17 @@ class AnalizadorBiblioteca(QThread):
                     t0 = time.monotonic()
                     result = analizar_archivo(ruta)
                     _guardar_cache(cache_key, result)
-                    print(f"Analizado: {os.path.basename(ruta)} -> {result['bpm']:.1f} BPM")
+                    k = (result.get("key") or {}).get("camelot")
+                    print(f"Analizado: {os.path.basename(ruta)} -> {result['bpm']:.1f} BPM, clave {k or '?'}")
                     if time.monotonic() - t0 > 60.0:
                         print(f"[análisis] ese tema tardó {time.monotonic() - t0:.0f} s")
+                else:                                   # análisis viejo sin tonalidad: se completa solo la clave
+                    with open(cache_key, encoding="utf-8") as f:
+                        data = json.load(f)
+                    if "key" not in data:
+                        data["key"] = analizar_archivo(ruta, solo_clave=True)
+                        _guardar_cache(cache_key, data)
+                        print(f"Clave: {os.path.basename(ruta)} -> {data['key'].get('camelot') or '?'}")
             except Exception:
                 import traceback; traceback.print_exc()
             self.tema_listo.emit(ruta)
@@ -1041,7 +1115,7 @@ class Deck(QFrame):
         self.cursor = 0
         self._cursor_frac = 0.0
         self.playing = False
-        self.volume = 0.8
+        self.volume = 1.0          # volumen de cada deck fijo al 100 %: el nivel se maneja con el crossfader y el volumen general
         self.auto_gain = 1.0
         self.tempo_rate = 1.0
         self.trim = 1.0
@@ -1086,34 +1160,25 @@ class Deck(QFrame):
         self.btn_play = QPushButton("▶")
         self.btn_pause = QPushButton("⏸")
         self.btn_stop = QPushButton("⏹")
-        self.btn_cue = QPushButton("CUE")
         self.btn_reset = QPushButton("⟲")
         for b in (self.btn_load, self.btn_play, self.btn_pause,
-                  self.btn_stop, self.btn_cue, self.btn_reset):
+                  self.btn_stop, self.btn_reset):
             b.setFixedHeight(38); b.setFixedWidth(58); r3.addWidget(b)
-            fb = b.font(); fb.setPointSizeF(17.0 if b is not self.btn_cue else 12.0); fb.setBold(True); b.setFont(fb)
+            fb = b.font(); fb.setPointSizeF(17.0); fb.setBold(True); b.setFont(fb)
         self.btn_load.clicked.connect(self.load_dialog)
         self.btn_play.clicked.connect(self.play)
         self.btn_pause.clicked.connect(self.pause)
         self.btn_stop.clicked.connect(self.stop)
-        self.btn_cue.clicked.connect(self.cue)
         self.btn_reset.clicked.connect(lambda *_: self.reset_tempo())
         self.btn_reset.setToolTip("Resetear el tempo al 100 % (el tema sigue donde está)")
-        r3.addStretch()
-        lay.addLayout(r3)
-
-        r4 = QHBoxLayout()
-        r4.addWidget(QLabel("Vol"))
-        self.sld_vol = QSlider(Qt.Orientation.Horizontal)
-        self.sld_vol.setRange(0, 100); self.sld_vol.setValue(80)
-        r4.addWidget(self.sld_vol, stretch=1)
-        r4.addWidget(QLabel("Tempo"))
+        r3.addSpacing(6)
+        r3.addWidget(QLabel("Tempo"))                    # el slider de tempo va en la misma fila, a la derecha del botón de reset
         self.sld_tempo = QSlider(Qt.Orientation.Horizontal)
         self.sld_tempo.setRange(50, 200); self.sld_tempo.setValue(100)
-        r4.addWidget(self.sld_tempo, stretch=1)
-        lay.addLayout(r4)
+        self.sld_tempo.setMinimumWidth(120)
+        r3.addWidget(self.sld_tempo, stretch=1)
+        lay.addLayout(r3)
 
-        self.sld_vol.valueChanged.connect(self._update_vol)
         self.sld_tempo.valueChanged.connect(self._update_tempo)
 
     def dragEnterEvent(self, e: QDragEnterEvent):
@@ -1275,21 +1340,6 @@ class Deck(QFrame):
                 import traceback; traceback.print_exc()
 
     reset_time = reset_tempo      # nombre anterior, por compatibilidad
-
-    def cue(self):
-        if not self.analysis:
-            return
-        kicks = self.analysis.get("kicks_full") or self.analysis.get("kicks", [])
-        fb = kicks[0] if kicks else (
-            self.analysis["beats_full"][0] if self.analysis.get("beats_full")
-            else (self.analysis["beats"][0] if self.analysis.get("beats") else 0)
-        )
-        with self.lock:
-            self.cursor = int(fb * self.sr)
-            self._cursor_frac = 0.0
-
-    def _update_vol(self):
-        self.volume = self.sld_vol.value() / 100.0
 
     def _update_tempo(self):
         self.tempo_rate = self.sld_tempo.value() / 100.0
@@ -2225,6 +2275,9 @@ class Biblioteca(QListWidget):
         f = self.font(); f.setPointSize(int(round(9 * FUENTE_BOOST))); self.setFont(f)
         self._rutas = set()
         self._cola = set()         # temas esperando su análisis (se muestran con ⏳)
+        self._memo = {}            # ruta -> (bpm, clave Camelot, nombre de la nota, hay_clave): se lee el .json una sola vez
+        self._memo_frase = {}      # ruta -> True si el tema tiene grilla de compases firme (sirve para mezclar en frase)
+        self._referencia = None    # clave Camelot del tema que suena: los compatibles se pintan de verde
 
     @staticmethod
     def _clave(p):
@@ -2238,7 +2291,12 @@ class Biblioteca(QListWidget):
         for i in range(self.count()):
             it = self.item(i)
             esperando = self._clave(it.data(Qt.ItemDataRole.UserRole)) in self._cola
-            nuevo = ("⏳ " if esperando else "") + self._nombre(it)
+            bpm, clave = self.info(it.data(Qt.ItemDataRole.UserRole))[:2]
+            pref = (f"{bpm:.0f} - " if bpm else "") + (f"[{clave}] " if clave else "")      # ej.: "124 - [8A] nombre del tema"
+            nom = self._nombre(it)
+            if bpm:                                   # el BPM ya va adelante: se saca el "[73 BPM]" que traiga el nombre del archivo
+                nom = re.sub(r"\s*[\[\(]\s*\d+(?:[.,]\d+)?\s*BPM\s*[\]\)]\s*", " ", nom, flags=re.I).strip() or nom
+            nuevo = ("⏳ " if esperando else "") + pref + nom
             if it.text() != nuevo:
                 it.setText(nuevo)
 
@@ -2249,9 +2307,92 @@ class Biblioteca(QListWidget):
 
     def quitar_de_cola(self, ruta):
         k = self._clave(ruta)
-        if k in self._cola:
-            self._cola.discard(k)
-            self._refrescar_textos()
+        self._memo.pop(k, None); self._memo_frase.pop(k, None)     # terminó su análisis: se vuelve a leer
+        self._cola.discard(k)
+        self._refrescar_textos()
+        self.pintar(*self._ult_pintado) if getattr(self, "_ult_pintado", None) else None
+
+    def info(self, ruta):
+        """(bpm, clave Camelot, nombre de la nota, hay_clave) del tema, desde su caché de análisis."""
+        k = self._clave(ruta)
+        v = self._memo.get(k)
+        if v is None:
+            bpm = cam = nom = None; hay = False; fr = False
+            try:
+                cache = CACHE_DIR / (Path(ruta).stem + ".json")
+                if cache.exists():
+                    with open(cache, encoding="utf-8") as f:
+                        d = json.load(f)
+                    b = d.get("bpm"); bpm = float(b) if b is not None else None
+                    fr = len(d.get("downbeats_full") or d.get("downbeats") or []) >= 9 and d.get("grid") != 0
+                    if "key" in d:
+                        hay = True
+                        cam = (d["key"] or {}).get("camelot"); nom = (d["key"] or {}).get("nombre")
+            except Exception:
+                pass
+            v = (bpm, cam, nom, hay)
+            self._memo[k] = v
+            self._memo_frase[k] = bool(fr)
+        return v
+
+    def frase_ok(self, ruta):
+        self.info(ruta)
+        return self._memo_frase.get(self._clave(ruta), False)
+
+    def ordenar_inteligente(self, armonico, frase, inicio=None):
+        """Ordena la lista de arriba hacia abajo como una cadena de mezcla: cada tema es el que mejor engancha con el
+        anterior (clave compatible primero, BPM parecido después). Con 'frase' van primero los que tienen grilla de
+        compases firme. Los que todavía no tienen análisis quedan al final. `inicio`: tema donde arranca la cadena."""
+        n = self.count()
+        if n < 2:
+            return
+        barra = self.verticalScrollBar().value()
+        sel = {self._clave(it.data(Qt.ItemDataRole.UserRole)) for it in self.selectedItems()}
+        items = [self.item(i) for i in range(n)]
+        datos = []
+        for it in items:
+            r = it.data(Qt.ItemDataRole.UserRole)
+            bpm, cam, _, hay = self.info(r)
+            datos.append({"it": it, "r": r, "k": self._clave(r), "bpm": bpm, "cam": cam if armonico else None,
+                          "ok": (not frase) or self.frase_ok(r), "nombre": self._nombre(it).lower()})
+        listos = [d for d in datos if d["bpm"] and (d["ok"] or not frase) and (d["cam"] or not armonico)]
+        resto = [d for d in datos if d not in listos]
+        listos.sort(key=lambda d: (d["bpm"], d["nombre"]))
+        cadena = []
+        if listos:
+            ini = next((d for d in listos if inicio and d["k"] == self._clave(inicio)), listos[0])
+            cur = ini; listos.remove(ini); cadena.append(cur)
+            while listos:
+                def puntaje(d):
+                    nivel = compat_armonica(cur["cam"], d["cam"]) if armonico else 0
+                    dif = abs(d["bpm"] / cur["bpm"] - 1.0)
+                    return ((nivel or 0) * 10.0 - dif * 150.0, -d["bpm"])
+                cur = max(listos, key=puntaje)
+                listos.remove(cur); cadena.append(cur)
+        resto.sort(key=lambda d: (d["bpm"] is None, d["bpm"] or 0.0, d["nombre"]))     # sin clave/grilla: al final, por BPM
+        orden = [d["k"] for d in cadena + resto]
+        if orden == [self._clave(self.item(i).data(Qt.ItemDataRole.UserRole)) for i in range(n)]:
+            return                                              # ya está en ese orden: no se toca nada
+        self.setUpdatesEnabled(False)
+        try:
+            while self.count() > 0:
+                self.takeItem(0)
+            for d in cadena + resto:
+                self.addItem(d["it"])
+                if d["k"] in sel:
+                    d["it"].setSelected(True)
+        finally:
+            self.setUpdatesEnabled(True)
+        self.verticalScrollBar().setValue(barra)
+        if getattr(self, "_ult_pintado", None):
+            self.pintar(*self._ult_pintado)
+        self.cambio.emit()
+
+    def set_referencia(self, clave):
+        if clave != self._referencia:
+            self._referencia = clave
+            if getattr(self, "_ult_pintado", None):
+                self.pintar(*self._ult_pintado)
 
     def agregar(self, rutas):
         n = 0
@@ -2272,6 +2413,7 @@ class Biblioteca(QListWidget):
         finally:
             self.setUpdatesEnabled(True)
         if n:
+            self._refrescar_textos()
             self.cambio.emit()
             self.nuevos.emit()
         return n
@@ -2287,36 +2429,44 @@ class Biblioteca(QListWidget):
         self.clear(); self._rutas.clear(); self._cola.clear(); self.cambio.emit()
 
     def pintar(self, ruta_a, ruta_b):
+        self._ult_pintado = (ruta_a, ruta_b)
         ka = os.path.normcase(os.path.abspath(ruta_a)) if ruta_a else None
         kb = os.path.normcase(os.path.abspath(ruta_b)) if ruta_b else None
         for i in range(self.count()):
             it = self.item(i)
-            k = os.path.normcase(os.path.abspath(it.data(Qt.ItemDataRole.UserRole)))
+            ruta = it.data(Qt.ItemDataRole.UserRole)
+            k = os.path.normcase(os.path.abspath(ruta))
             if k == ka:
                 it.setBackground(QBrush(QColor("#a8cdf2"))); it.setForeground(QBrush(QColor("#10253f")))
             elif k == kb:
                 it.setBackground(QBrush(QColor("#f2adc4"))); it.setForeground(QBrush(QColor("#4a0f26")))
             else:
-                it.setData(Qt.ItemDataRole.BackgroundRole, None)
-                it.setData(Qt.ItemDataRole.ForegroundRole, None)
+                nivel = compat_armonica(self._referencia, self.info(ruta)[1]) if self._referencia else None
+                if nivel == 2:                      # misma clave o relativa
+                    it.setBackground(QBrush(QColor("#bfe8c4"))); it.setForeground(QBrush(QColor("#0f3d18")))
+                elif nivel == 1:                    # vecina en la rueda
+                    it.setBackground(QBrush(QColor("#e6f0c2"))); it.setForeground(QBrush(QColor("#38400f")))
+                else:
+                    it.setData(Qt.ItemDataRole.BackgroundRole, None)
+                    it.setData(Qt.ItemDataRole.ForegroundRole, None)
 
     def todas(self):
         return [self.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.count())]
 
-    @staticmethod
-    def _bpm_de(ruta):
-        try:
-            cache = CACHE_DIR / (Path(ruta).stem + ".json")
-            if cache.exists():
-                with open(cache, encoding="utf-8") as f:
-                    v = json.load(f).get("bpm")
-                return float(v) if v is not None else None
-        except Exception:
-            pass
-        return None
+    def _bpm_de(self, ruta):
+        return self.info(ruta)[0]
 
     def temas_sin_bpm(self):
         return [r for r in self.todas() if self._bpm_de(r) is None]
+
+    def temas_sin_analisis(self):
+        """Sin BPM, o con análisis viejo al que le falta la tonalidad."""
+        out = []
+        for r in self.todas():
+            bpm, _, _, hay_clave = self.info(r)
+            if bpm is None or not hay_clave:
+                out.append(r)
+        return out
 
     def ordenar_por_bpm(self):
         self.setUpdatesEnabled(False)
@@ -2334,6 +2484,7 @@ class Biblioteca(QListWidget):
                 self.addItem(it)
         finally:
             self.setUpdatesEnabled(True)
+        self._refrescar_textos()
         self.cambio.emit()
 
     def guardar(self):
@@ -2835,6 +2986,17 @@ class AutoMix(QMainWindow):
         lib_btns.addWidget(b_quitar); lib_btns.addWidget(b_limpiar); lib_btns.addWidget(self.btn_ordenar)
         lib_btns.addWidget(self.btn_reanalizar)
         lib_lay.addLayout(lib_btns)
+        cfg_mi = leer_config()
+        self.chk_armonico = QCheckBox("🎼 Armónico")
+        self.chk_armonico.setToolTip("El siguiente tema se elige entre los que suenan bien con el actual (rueda de Camelot + BPM parecido),\nsin repetir los ya tocados. En la lista, los compatibles se pintan de verde.\nSi la clave de los dos choca, la mezcla se acorta para que no se note.")
+        self.chk_armonico.setChecked(bool(cfg_mi.get("armonico", True)))
+        self.chk_armonico.toggled.connect(lambda v: (guardar_config(armonico=bool(v)), self._reordenar_pronto(50)))
+        self.chk_frases = QCheckBox("🥁 En frase")
+        self.chk_frases.setToolTip("La mezcla automática arranca justo cuando el tema que suena empieza una frase (cada 8 compases),\ncon el tema entrante saliendo desde su primer compás, y dura un número exacto de compases.")
+        self.chk_frases.setChecked(bool(cfg_mi.get("frases", True)))
+        self.chk_frases.toggled.connect(lambda v: (guardar_config(frases=bool(v)), self._reordenar_pronto(50)))
+        fila_chk = QVBoxLayout(); fila_chk.setSpacing(0); fila_chk.addWidget(self.chk_armonico); fila_chk.addWidget(self.chk_frases)
+        lib_lay.addLayout(fila_chk)
         lib_lay.addWidget(EtiquetaElidida("Arrastrá un tema a Deck A o B"))
         self.ed_filtro.textChanged.connect(self._filtrar_biblioteca)
         self.biblioteca.cambio.connect(self._biblioteca_cambio)
@@ -3035,7 +3197,7 @@ class AutoMix(QMainWindow):
         QTimer.singleShot(0, self._ir_al_minimo)
 
         self.biblioteca.nuevos.connect(lambda: QTimer.singleShot(1500, self._auto_analizar))
-        self.biblioteca.ordenar_por_bpm()                     # al abrir: lista ordenada de menor a mayor BPM
+        self._ordenar_lista()                                 # al abrir: lista ordenada (cadena armónica/frase o, si no, por BPM)
         self._ordenar_al_terminar = True                      # y otra vez cuando termine de analizar lo que falte
         QTimer.singleShot(2500, self._auto_analizar)
 
@@ -3261,7 +3423,60 @@ class AutoMix(QMainWindow):
             self._cargar_siguiente(detenido)
         QTimer.singleShot(400, _run)
 
+    def _clave_de(self, deck):
+        """Clave Camelot del tema cargado en un deck (de su análisis o del caché de la biblioteca)."""
+        try:
+            if deck is None or not deck.path:
+                return None
+            k = ((deck.analysis or {}).get("key") or {}).get("camelot")
+            return k or self.biblioteca.info(deck.path)[1]
+        except Exception:
+            return None
+
+    def _siguiente_armonico(self, path_actual):
+        """Modo estricto: SOLO temas de clave compatible (misma, relativa o vecina) y BPM a ±8 %; el mejor primero,
+        sin repetir los ya tocados. Devuelve (ruta, None) o (None, motivo)."""
+        bib = self.biblioteca
+        if not path_actual:
+            return None, "no hay tema de referencia"
+        if not hasattr(self, "_tocados"):
+            self._tocados = set()
+        ref = bib._clave(path_actual)
+        self._tocados.add(ref)
+        for d in (self.deck_a, self.deck_b):
+            if d.path:
+                self._tocados.add(bib._clave(d.path))
+        bpm0, cam0, _, _ = bib.info(path_actual)
+        if cam0 is None or not bpm0:
+            return None, "el tema que suena no tiene clave analizada todavía"
+        def candidatos():
+            res = []
+            for orden, r in enumerate(bib.todas()):
+                if bib._clave(r) in self._tocados or not os.path.isfile(r):
+                    continue
+                bpm, cam, _, _ = bib.info(r)
+                nivel = compat_armonica(cam0, cam)
+                if not nivel or not bpm:                  # sin clave o que choca: no se considera
+                    continue
+                d = abs(bpm / bpm0 - 1.0)
+                if d > 0.08:                              # tempo demasiado lejano para enganchar
+                    continue
+                res.append((nivel * 10.0 - d * 150.0 - orden * 1e-3, d, r))
+            return res
+        cands = candidatos()
+        if not cands:                                  # ya se tocó todo lo compatible: se empieza otra vuelta
+            self._tocados = {ref} | {bib._clave(d.path) for d in (self.deck_a, self.deck_b) if d.path}
+            cands = candidatos()
+        if not cands:
+            return None, "ningún tema de la lista es compatible (clave y BPM) con el que suena"
+        return max(cands, key=lambda c: c[0])[2], None
+
     def _siguiente_en_biblioteca(self, path_actual):
+        if getattr(self, "chk_armonico", None) is not None and self.chk_armonico.isChecked():
+            try:
+                return self._siguiente_armonico(path_actual)      # estricto: si no hay compatible, no se carga ninguno
+            except Exception:
+                import traceback; traceback.print_exc()
         rutas = self.biblioteca.todas()
         clave = os.path.normcase(os.path.abspath(path_actual)) if path_actual else None
         for i, r in enumerate(rutas):
@@ -3291,7 +3506,112 @@ class AutoMix(QMainWindow):
             self._set_status(f"🔁 Carga automática: {motivo}")
             return
         destino.load_track(ruta)
-        self._set_status(f"🔁 Deck {destino.name} en espera: {os.path.basename(ruta)}")
+        k_sale, k_entra = self._clave_de(otro), self.biblioteca.info(ruta)[1]
+        extra = f"  🎼 {k_sale}→{k_entra}" if (k_sale and k_entra) else ""
+        self._set_status(f"🔁 Deck {destino.name} en espera: {os.path.basename(ruta)}{extra}")
+
+    # ================= MEZCLA EN FRASE =================
+    FRASE_COMPASES = 8
+
+    def _db_de(self, deck):
+        a = deck.analysis or {}
+        db = a.get("downbeats_full") or a.get("downbeats") or []
+        return np.asarray(db, dtype=np.float64)
+
+    def _hasta_proxima_frase(self, sale):
+        """Segundos reales hasta que el tema que suena empiece su próxima frase (cada 8 compases desde su primer
+        compás). None si no hay grilla."""
+        db = self._db_de(sale)
+        if len(db) < self.FRASE_COMPASES + 1 or sale.audio is None:
+            return None
+        pos = sale.position_seconds()
+        lim = db[::self.FRASE_COMPASES]
+        sig = lim[lim > pos + 0.12]
+        if not len(sig):
+            return None
+        return float((sig[0] - pos) / max(1e-6, sale.rate_eff))
+
+    def _disparar_mezcla_auto(self, exacto=False):
+        """Punto único de arranque de las mezclas automáticas (auto-enganche y carga automática).
+        Con '🥁 En frase' espera al próximo comienzo de frase del tema que suena para arrancar justo ahí."""
+        if getattr(self, "_frase_armada", False):
+            return
+        if self.mix_timer.isActive() or self.mix_pausa_timer.isActive():
+            return
+        f = self.crossfader.value()
+        sale = self.deck_a if f <= 50 else self.deck_b
+        entra = self.deck_b if sale is self.deck_a else self.deck_a
+        if self.chk_armonico.isChecked():              # estricto: solo se engancha un tema compatible
+            ks, ke = self._clave_de(sale), self._clave_de(entra)
+            nivel = compat_armonica(ks, ke)
+            try:
+                bs = float((sale.analysis or {}).get("bpm", 0)) * sale.rate_eff
+                be = float((entra.analysis or {}).get("bpm", 0)) * entra.tempo_rate
+                lejos = bs > 0 and be > 0 and abs(be / bs - 1.0) > 0.08
+            except Exception:
+                lejos = False
+            if not nivel or lejos:
+                msg = (f"🎼 No se mezcla: {ks or '?'} → {ke or '?'} no es compatible" if not nivel
+                       else "🎼 No se mezcla: el BPM del tema en espera está demasiado lejos")
+                if getattr(self, "_aviso_armonico", None) != msg:
+                    self._aviso_armonico = msg
+                    print("[mezcla]", msg)
+                    self._set_status(msg)
+                return
+            self._aviso_armonico = None
+        espera = None
+        if self.chk_frases.isChecked() and not exacto and sale.playing and sale.analysis and entra.analysis and entra.audio is not None:
+            espera = self._hasta_proxima_frase(sale)
+            if espera is not None:
+                dur = self._duracion_mezcla_para(sale, entra, True)
+                resta = (len(sale.audio) - sale.cursor) / (sale.sr * max(1e-6, sale.rate_eff))
+                if espera + dur + 4.0 > resta:        # esperar a la frase no deja tiempo: se mezcla ya
+                    espera = None
+        if espera is None or espera < 0.05:
+            if not entra.playing and entra.audio is not None and entra.analysis:
+                db_e = self._db_de(entra)
+                if len(db_e):
+                    entra.set_position_seconds(float(db_e[0]))      # el entrante sale desde su primer compás
+            self._mix_auto = True
+            self._mix_clicked()
+            return
+        self._frase_armada = True
+        pa, pb = self.deck_a.path, self.deck_b.path
+        self._set_status(f"🥁 Mezcla armada: arranca en la próxima frase ({espera:.1f} s)")
+        def _go():
+            self._frase_armada = False
+            if (self.deck_a.path, self.deck_b.path) != (pa, pb) or self.mix_timer.isActive() or self.mix_pausa_timer.isActive():
+                return                                  # cambió algo mientras esperaba (mezcla manual, otro tema…)
+            if not entra.playing and entra.audio is not None and entra.analysis:
+                db_e = self._db_de(entra)
+                if len(db_e):
+                    entra.set_position_seconds(float(db_e[0]))      # el entrante sale desde su primer compás
+            self._mix_auto = True
+            self._mix_clicked()
+        QTimer.singleShot(int(max(0.0, espera - 0.02) * 1000), _go)
+
+    def _duracion_mezcla_para(self, sale, entra, auto):
+        """Duración de la mezcla: la elegida por el usuario. En las automáticas se ajusta a compases enteros y,
+        si las tonalidades chocan o los BPM son muy distintos, se acorta para pasar rápido de un tema al otro."""
+        dur = float(self.spin_mix.value())
+        if not auto:
+            return dur
+        try:
+            bpm = float((sale.analysis or {}).get("bpm", 0)) * sale.rate_eff
+            comp = compat_armonica(self._clave_de(sale), self._clave_de(entra)) if self.chk_armonico.isChecked() else None
+            bpm_e = float((entra.analysis or {}).get("bpm", 0)) * entra.tempo_rate
+            dif = abs(bpm_e / bpm - 1.0) if bpm > 0 and bpm_e > 0 else 0.0
+            if bpm > 0 and self.chk_frases.isChecked():
+                compas = 4.0 * 60.0 / bpm
+                n = min((2, 4, 8, 16), key=lambda c: abs(math.log2(c) - math.log2(max(0.5, dur / compas))))   # compases de verdad: 2, 4, 8 o 16
+                if comp == 0 or dif > 0.08:
+                    n = 2                             # choque de tonalidad o de tempo: corte rápido, 2 compases
+                dur = n * compas
+            elif comp == 0 or dif > 0.08:
+                dur = min(dur, 4.0)
+        except Exception:
+            pass
+        return max(1.0, dur)
 
     def _auto_vigilar(self):
         if not self.carga_auto or self.mix_timer.isActive() or self.mix_pausa_timer.isActive():
@@ -3308,7 +3628,7 @@ class AutoMix(QMainWindow):
         resta = (len(sonando.audio) - sonando.cursor) / (sonando.sr * max(1e-6, sonando.rate_eff))
         if resta <= max(float(self.auto_s), self.spin_mix.value() + 4.0):   # +3 s de pausa al 50 % +1 s de margen
             self._set_status(f"🔁 Mezcla automática hacia el Deck {espera.name}")
-            self._mix_clicked()
+            self._disparar_mezcla_auto()
 
     _analizador_bib = None
     _fallidos = None
@@ -3323,6 +3643,7 @@ class AutoMix(QMainWindow):
         _mantener_vivo(a)
         a.progreso.connect(lambda i, t: self._set_status(f"{texto}: {i}/{t}"))
         a.tema_listo.connect(self.biblioteca.quitar_de_cola)
+        a.tema_listo.connect(lambda _r: self._reordenar_pronto())          # la lista se va ordenando a medida que se analiza
         a.terminado.connect(fin)
         self._analizador_bib = a
         a.start()
@@ -3330,7 +3651,7 @@ class AutoMix(QMainWindow):
     def _pendientes(self):
         if self._fallidos is None:
             self._fallidos = set()
-        return [r for r in self.biblioteca.temas_sin_bpm()
+        return [r for r in self.biblioteca.temas_sin_analisis()
                 if self.biblioteca._clave(r) not in self._fallidos and os.path.isfile(r)]
 
     def _auto_analizar(self):
@@ -3348,18 +3669,47 @@ class AutoMix(QMainWindow):
         self.biblioteca.marcar(())
         if self._fallidos is None:
             self._fallidos = set()
-        for r in self.biblioteca.temas_sin_bpm():            # los que no se pudieron analizar no se reintentan en bucle
+        for r in self.biblioteca.temas_sin_analisis():       # los que no se pudieron analizar no se reintentan en bucle
             self._fallidos.add(self.biblioteca._clave(r))
         if self._ordenar_al_terminar:
             self._ordenar_al_terminar = False
-            self.biblioteca.ordenar_por_bpm()
-            self._set_status("✅ Biblioteca ordenada por BPM")
+            self._ordenar_lista()
+            self._set_status("✅ Biblioteca ordenada")
         else:
             self._set_status("✅ Lista analizada")
         QTimer.singleShot(300, self._auto_analizar)           # por si se agregaron temas mientras tanto
 
+    def _ordenar_lista(self):
+        """Con 🎼 Armónico y/o 🥁 En frase la lista se ordena como cadena de mezcla (empezando por el tema que
+        suena); sin ninguna, por BPM de menor a mayor."""
+        arm, fra = self.chk_armonico.isChecked(), self.chk_frases.isChecked()
+        if not (arm or fra):
+            self.biblioteca.ordenar_por_bpm()
+            return
+        prim = self._deck_primario()
+        inicio = prim.path if (prim is not None and prim.path) else None
+        self.biblioteca.ordenar_inteligente(arm, fra, inicio)
+
+    def _reordenar_pronto(self, ms=600):
+        """Reordena la lista (con retardo, para agrupar varios cambios) a medida que se analizan los temas."""
+        t = getattr(self, "_t_reordenar", None)
+        if t is None:
+            t = self._t_reordenar = QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(self._reordenar_ahora)
+        t.start(ms)
+
+    def _reordenar_ahora(self):
+        if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:     # no mover la lista mientras se arrastra un tema
+            self._reordenar_pronto(500)
+            return
+        try:
+            self._ordenar_lista()
+        except Exception:
+            import traceback; traceback.print_exc()
+
     def _ordenar_biblioteca_bpm(self):
-        self.biblioteca.ordenar_por_bpm()                     # ya: primero los que tienen BPM conocido
+        self._ordenar_lista()                                 # ya: primero los que tienen BPM conocido
         self._fallidos = set()                                # un clic explícito vuelve a intentar los que fallaron
         faltan = self._pendientes()
         if not faltan:
@@ -3606,8 +3956,8 @@ class AutoMix(QMainWindow):
             gan_a = min(1.0, max(0.0, (1.0 - x) / tramo))
             gan_b = min(1.0, max(0.0, x / tramo))
 
-        self.deck_a.volume = gan_a * (self.deck_a.sld_vol.value() / 100.0)
-        self.deck_b.volume = gan_b * (self.deck_b.sld_vol.value() / 100.0)
+        self.deck_a.volume = gan_a
+        self.deck_b.volume = gan_b
 
         self._apply_shared_bpm(x)
 
@@ -3828,6 +4178,7 @@ class AutoMix(QMainWindow):
 
         entra = self.deck_b if target == 100 else self.deck_a
         if entra.audio is None:
+            self._mix_auto = False
             self._set_status(f"⚠️ Cargá un tema en Deck {entra.name}")
             return
         if not entra.analysis:               # sin grilla no se puede emparejar: se espera a que termine el análisis
@@ -3851,7 +4202,14 @@ class AutoMix(QMainWindow):
         self.mix_from = current
         self.mix_to = target
 
-        duration_s = float(self.spin_mix.value())
+        auto = bool(getattr(self, "_mix_auto", False)); self._mix_auto = False
+        sale_d = self.deck_a if entra is self.deck_b else self.deck_b
+        duration_s = self._duracion_mezcla_para(sale_d, entra, auto)
+        if auto:
+            ks, ke = self._clave_de(sale_d), self._clave_de(entra)
+            nivel = compat_armonica(ks, ke)
+            marca = {2: "✔ compatibles", 1: "≈ vecinas", 0: "✖ chocan → mezcla corta"}.get(nivel, "")
+            print(f"[mezcla] {ks or '?'} → {ke or '?'} {marca} · {duration_s:.1f} s")
         interval_ms = 50
         self.mix_steps_total = int(duration_s * (1000.0 / interval_ms))
         self.mix_steps_done = 0
@@ -3968,7 +4326,7 @@ class AutoMix(QMainWindow):
                     f"⚓ Auto-enganche disparado (marca {self._marca_frac * 100:.1f}%) → mezcla"
                 )
                 try:
-                    self._mix_clicked()
+                    self._disparar_mezcla_auto(exacto=True)      # la marca roja manda: se engancha JUSTO ahí, sin esperar frase
                 except Exception:
                     import traceback; traceback.print_exc()
 
@@ -3982,10 +4340,15 @@ class AutoMix(QMainWindow):
         self.deck_a.tick()
         self.deck_b.tick()
         self._mb_actualizar_barras()
-        rutas = (self.deck_a.path, self.deck_b.path, self.biblioteca.count())
+        prim = self._deck_primario()
+        rutas = (self.deck_a.path, self.deck_b.path, self.biblioteca.count(), prim.path if prim is not None else None,
+                 self._clave_de(prim))
         if rutas != getattr(self, "_rutas_pintadas", None):
             self._rutas_pintadas = rutas
+            self.biblioteca.set_referencia(rutas[4])
             self.biblioteca.pintar(self.deck_a.path, self.deck_b.path)
+            if self.chk_armonico.isChecked() or self.chk_frases.isChecked():
+                self._reordenar_pronto(400)               # la cadena sigue al tema que suena
         try:
             self._auto_vigilar()
         except Exception:
