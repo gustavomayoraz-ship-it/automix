@@ -1,5 +1,5 @@
 """
-MiniMixMeister Pro — PySide6
+AutoMix Pro — PySide6
 - Play individual por deck
 - Waveform de cada deck se mueve SOLO si suena
 - 🔗 Sync automático de BPM y downbeats sin tirones
@@ -34,7 +34,7 @@ CACHE_DIR.mkdir(exist_ok=True)
 
 try:                                  # el proceso hijo del análisis deja sus errores en cache/hijo.log
     import multiprocessing as _mp0
-    if _mp0.parent_process() is not None:
+    if _mp0.current_process().name != "MainProcess":      # (parent_process() sigue en None mientras el hijo importa este archivo)
         import faulthandler
         _f_hijo = open(CACHE_DIR / "hijo.log", "a", encoding="utf-8", buffering=1)
         sys.stderr = _f_hijo
@@ -44,7 +44,7 @@ except Exception:
 
 # (módulo, paquete de pip): si falta alguno dentro de ./dependencias_offline se descarga ahí al abrir el programa
 DEPENDENCIAS = [("numpy", "numpy"), ("scipy", "scipy"), ("soundfile", "soundfile"),
-                ("sounddevice", "sounddevice"), ("librosa", "librosa"), ("PySide6", "PySide6")]
+                ("sounddevice", "sounddevice"), ("librosa", "librosa"), ("PySide6", "PySide6-Essentials")]   # Essentials: solo Widgets/Core/Gui (~400 MB menos)
 
 
 def _modulo_en_offline(mod):
@@ -86,7 +86,7 @@ def asegurar_dependencias():
     ./dependencias_offline y descarga ahí las que falten. Solo corre en el proceso principal."""
     try:
         import multiprocessing as _mp1
-        if _mp1.parent_process() is not None:
+        if _mp1.current_process().name != "MainProcess":      # proceso hijo del análisis: nada de ventanas
             return
     except Exception:
         pass
@@ -351,7 +351,7 @@ class ConsolaOculta:
                 k32.AllocConsole()
             hwnd = k32.GetConsoleWindow()
             k32.SetConsoleOutputCP(65001)
-            k32.SetConsoleTitleW("MiniMixMeister — consola (se cierra con el botón 🖥, no con la X)")
+            k32.SetConsoleTitleW("AutoMix — consola (se cierra con el botón 🖥, no con la X)")
             try:
                 k32.SetConsoleCtrlHandler(None, True)         # Ctrl+C acá no cierra el programa
                 hmenu = u32.GetSystemMenu(hwnd, False)
@@ -2427,8 +2427,8 @@ class UnifiedTimeline(QGraphicsView):
     def redraw(self):
         self.scene_.clear()
 
-        W = max(600, self.viewport().width())
-        H = max(220, self.viewport().height())
+        W = max(100, self.viewport().width())      # tamaño REAL del visor: si se forzaba un mínimo mayor,
+        H = max(60, self.viewport().height())      # la escena quedaba más grande que la vista y se cortaba
         self.scene_.setSceneRect(0, 0, W, H)
 
         mid = H / 2
@@ -2782,7 +2782,7 @@ class SmartSync:
 # =====================================================================
 # 6) VENTANA PRINCIPAL
 # =====================================================================
-class MiniMixMeister(QMainWindow):
+class AutoMix(QMainWindow):
     def __init__(self):
         super().__init__()
         cfg = leer_config()
@@ -2799,7 +2799,7 @@ class MiniMixMeister(QMainWindow):
         self._marca_disparada = False
         self._ultimo_prog_primario = 0.0
         self._ultimo_deck_primario = None
-        self.setWindowTitle("MiniMixMeister Pro 🎚️")
+        self.setWindowTitle("AutoMix Pro 🎚️")
         self.resize(1560, 850)
 
         split = QSplitter(Qt.Orientation.Horizontal)
@@ -3425,6 +3425,32 @@ class MiniMixMeister(QMainWindow):
             self.resize(self.width() + lw, self.height())
             self._ratio_lista = (2.0 * lw) / float(self.width())
             self._escalar_segun_ventana()
+        self._ajustar_a_pantalla()
+
+    def _ajustar_a_pantalla(self):
+        """Al iniciar: que la ventana entre en la pantalla (barra de tareas incluida), centrada, con el
+        contenido re-escalado y el timeline redibujado con su tamaño final."""
+        try:
+            scr = self.screen() or QApplication.primaryScreen()
+            ag = scr.availableGeometry()
+            fg, g = self.frameGeometry(), self.geometry()
+            marco_w, marco_h = fg.width() - g.width(), fg.height() - g.height()
+            w = min(self.width(), ag.width() - marco_w)
+            h = min(self.height(), ag.height() - marco_h)
+            self.resize(w, h)
+            self.move(ag.left() + (ag.width() - (w + marco_w)) // 2,
+                      ag.top() + (ag.height() - (h + marco_h)) // 2)
+        except Exception:
+            pass
+        self._escalar_segun_ventana()
+        QTimer.singleShot(0, self._redibujar_timeline_inicial)
+        QTimer.singleShot(250, self._redibujar_timeline_inicial)
+
+    def _redibujar_timeline_inicial(self):
+        try:
+            self.timeline.redraw()
+        except Exception:
+            pass
 
     def _splitter_movido(self, *_):
         tot = sum(self.split.sizes())
@@ -3988,7 +4014,7 @@ class MiniMixMeister(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    w = MiniMixMeister()
+    w = AutoMix()
     w.show()
     sys.exit(app.exec())
 
