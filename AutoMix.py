@@ -490,7 +490,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QAbstractItemView, QSpinBox, QDialog, QCheckBox, QSizePolicy,
     QLayout, QScrollBar, QAbstractScrollArea, QProgressBar, QGridLayout, QGraphicsDropShadowEffect
 )
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, QPointF, QMimeData, QUrl, QSize, QRectF, QPoint
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QPointF, QMimeData, QUrl, QSize, QRectF, QPoint, QEvent
 from PySide6.QtGui import (
     QGuiApplication, QDragEnterEvent, QDropEvent, QColor, QPen, QPainter, QBrush,
     QPolygonF, QFont, QCursor, QKeyEvent, QShortcut, QKeySequence,
@@ -4748,6 +4748,21 @@ class AutoMix(QMainWindow):
         for lay in self.findChildren(QLayout):
             m = lay.contentsMargins()
             self._esc_layouts.append((lay, m.left(), m.top(), m.right(), m.bottom(), lay.spacing()))
+
+    def changeEvent(self, e):
+        super().changeEvent(e)
+        try:
+            if e.type() == QEvent.Type.WindowStateChange:
+                antes_max = bool(e.oldState() & Qt.WindowState.WindowMaximized)
+                if antes_max and not (self.windowState() & (Qt.WindowState.WindowMaximized | Qt.WindowState.WindowMinimized | Qt.WindowState.WindowFullScreen)):
+                    QTimer.singleShot(0, self._volver_al_minimo)      # al des-maximizar: vuelve al tamaño mínimo de arranque
+        except Exception:
+            pass
+
+    def _volver_al_minimo(self):
+        log("ventana", "restaurada: vuelve al tamaño mínimo")
+        self._aplicar_escala(ESC_MIN)                  # el mínimo depende de la escala: primero la de arranque
+        self._ir_al_minimo()
 
     def _ir_al_minimo(self):
         self.resize(self.minimumSizeHint())
