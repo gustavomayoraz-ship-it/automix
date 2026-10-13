@@ -432,6 +432,30 @@ class _TeeConsola:
 
 
 CONSOLA = ConsolaOculta()
+
+
+_LOG_DIF = {}
+
+
+def _log_diferido(clave, cat, msg, ms=450):
+    """Para sliders: registra solo el valor final, no cada paso intermedio."""
+    try:
+        t = _LOG_DIF.get(clave)
+        if t is None:
+            t = QTimer(); t.setSingleShot(True); _LOG_DIF[clave] = [t, None]
+            t.timeout.connect(lambda c=clave: log(*_LOG_DIF[c][1]))
+            t = _LOG_DIF[clave]
+        t[1] = (cat, msg); t[0].start(ms)
+    except Exception:
+        pass
+
+
+def log(cat, msg=""):
+    """Todo lo que hace el programa va a la consola con hora: log('deck A', 'play')."""
+    try:
+        print(f"[{cat}] {msg}" if msg else f"[{cat}]")
+    except Exception:
+        pass
 try:
     import multiprocessing as _mp
     if _mp.parent_process() is None:          # el proceso hijo del análisis no toca la consola
@@ -1627,6 +1651,7 @@ class Deck(QFrame):
         self.auto_gain = 1.0
         self._ag_listo = False
         self.path = path
+        log(f"deck {self.name}", f"cargando: {os.path.basename(path)}")
         self._marcar_cargado(True)
         self.lbl_track.setText(os.path.basename(path))
         self.lbl_bpm.setText("⏳ Analizando…")
@@ -1652,6 +1677,7 @@ class Deck(QFrame):
                 self.sr = sr
                 self.cursor = 0
                 self._cursor_frac = 0.0
+            log(f"deck {self.name}", f"audio listo: {len(y32) / sr:.1f} s · {sr} Hz · auto-gain x{ag:.2f} · {os.path.basename(path)}")
         except Exception as e:
             print("Error cargando audio:", e)
 
@@ -1726,12 +1752,18 @@ class Deck(QFrame):
                 self.on_play_cb(self)
             except Exception:
                 import traceback; traceback.print_exc()
+        if not self.playing:
+            log(f"deck {self.name}", f"▶ play · {self.lbl_bpm.text().replace(chr(10), ' ')} · tempo {self.tempo_rate * 100:.0f} %")
         self.playing = True
 
     def pause(self):
+        if self.playing:
+            log(f"deck {self.name}", f"⏸ pausa en {self.position_seconds():.1f} s")
         self.playing = False
 
     def stop(self):
+        if self.playing:
+            log(f"deck {self.name}", "⏹ stop")
         self.playing = False
         self.trim = 1.0
         with self.lock:
@@ -1773,6 +1805,8 @@ class Deck(QFrame):
         self.trim = 1.0
         self.tempo_manual = False
         self._cancelar_reset_suave()
+        if abs(self.tempo_rate - 1.0) > 1e-6:
+            log(f"deck {self.name}", f"tempo {self.tempo_rate * 100:.0f} % → 100 % ({'progresivo' if suave and self.playing else 'inmediato'})")
         if suave and self.playing and abs(self.tempo_rate - 1.0) > 0.004:
             if getattr(self, "_rs_timer", None) is None:
                 self._rs_timer = QTimer(self); self._rs_timer.setInterval(30)
@@ -1802,6 +1836,7 @@ class Deck(QFrame):
         self._cancelar_reset_suave()
         self.tempo_rate = self.sld_tempo.value() / 100.0
         self.tempo_manual = (self.sld_tempo.value() != 100)      # (los cambios por programa bloquean la señal: esto es del usuario)
+        _log_diferido(f"tempo{self.name}", f"deck {self.name}", f"tempo manual {self.sld_tempo.value()} % ({(self.original_bpm or 0) * self.tempo_rate:.1f} BPM)")
         self._update_bpm_label()
 
     def set_tempo_from_fader(self, rate):
@@ -3208,12 +3243,14 @@ class Biblioteca(QListWidget):
         finally:
             self.setUpdatesEnabled(True)
         if n:
+            log("biblioteca", f"+{n} tema(s) agregado(s) · total {self.count()}")
             self._refrescar_textos()
             self.cambio.emit()
             self.nuevos.emit()
         return n
 
     def quitar_seleccion(self):
+        log("biblioteca", f"quitando {len(self.selectedItems())} tema(s)")
         for it in self.selectedItems():
             p = it.data(Qt.ItemDataRole.UserRole)
             self._rutas.discard(os.path.normcase(os.path.abspath(p)))
@@ -3221,6 +3258,7 @@ class Biblioteca(QListWidget):
         self.cambio.emit()
 
     def limpiar(self):
+        log("biblioteca", "lista vaciada")
         self.clear(); self._rutas.clear(); self._cola.clear(); self.cambio.emit()
 
     def pintar(self, ruta_a, ruta_b):
@@ -4195,6 +4233,8 @@ class AutoMix(QMainWindow):
 
     def _mb_cambio(self, *_):
         self.lbl_mb.setText(f"{self.sld_mb.value()} %")
+        _log_diferido("mb", "multibanda", f"intensidad {self.sld_mb.value()} % · máx {self.sld_lim.value()} dB · vel {self.sld_vel.value() / 10:.1f} dB/s · "
+                      f"golpe {self.sld_golpe.value()} % · medios {self.sld_medios.value()} dB · agudos {self.sld_agudos.value()} dB")
         mb = self.mixer.mb
         mb.intensidad = self.sld_mb.value() / 100.0
         mb.eq.limite = float(self.sld_lim.value())
@@ -4230,6 +4270,7 @@ class AutoMix(QMainWindow):
                 self._mb_pintando = False
 
     def _vol_general_cambio(self, v):
+        _log_diferido("vol", "volumen", f"general {v} %")
         self.lbl_master.setText(f"{v}%")
         self.mixer.set_volumen(v / 100.0)
         guardar_config(vol_general=int(v))
@@ -4241,6 +4282,7 @@ class AutoMix(QMainWindow):
             return 10
 
     def _duracion_mezcla_cambio(self, v):
+        log("config", f"duración de la mezcla: {v} s")
         self.btn_mix.setText(f"🎬 Mezclar ({v}s) [F2]")
         guardar_config(mezcla_s=int(v))
 
@@ -4318,16 +4360,20 @@ class AutoMix(QMainWindow):
         return {"pa": float(pa), "pb": float(pb), "ps": float(ps), "fa": float(fa), "nombre": nombre}
 
     def set_comp(self, v):
+        log("config", f"compensar nivel: {'sí' if v else 'no'}")
         self.comp_nivel = bool(v)
         guardar_config(comp_nivel=self.comp_nivel)
         if hasattr(self, "mixer"):
             self.mixer.comp_activo = self.comp_nivel
 
     def set_recetas(self, v):
+        log("config", f"recetas automáticas: {'sí' if v else 'no'}")
         self.recetas = bool(v)
         guardar_config(recetas=self.recetas)
 
     def set_forma_cruce(self, pa, pb, activo, ps=None, bandas=None):
+        _log_diferido("forma", "config", f"forma de cruce: A {pa:.0%} · B {pb:.0%} · activa {'sí' if activo else 'no'}"
+                      f"{'' if ps is None else f' · bajo {ps:.0%}'}{'' if bandas is None else f' · por bandas {chr(115)+chr(237) if bandas else chr(110)+chr(111)}'}")
         self.punto_a, self.punto_b, self.cruce_ab = float(pa), float(pb), bool(activo)
         if ps is not None:
             self.punto_s = float(ps)
@@ -4848,6 +4894,9 @@ class AutoMix(QMainWindow):
         self._set_status("🖥 Consola abierta (se cierra con este botón o con su X)" if visible else "🖥 Consola oculta")
 
     def _set_status(self, text):
+        if text != getattr(self, "_ult_status_log", None):          # lo que el programa "dice" también va a la consola
+            self._ult_status_log = text
+            log("estado", text)
         self.lbl_status.setText(text)
         try:
             self.btn_consola.setToolTip(f"{text}\n\nMostrar / ocultar la consola (todo lo que hace el programa, con hora)")
@@ -4908,6 +4957,8 @@ class AutoMix(QMainWindow):
     def _update_cf(self):
         fader_val = self.crossfader.value()
         fader_cambio = (self._fader_prev != fader_val)
+        if fader_cambio and not (self.mix_timer.isActive() or self.mix_pausa_timer.isActive()):
+            _log_diferido("cf", "crossfader", f"{fader_val} % (0 = A · 100 = B)")      # en las mezclas automáticas no: ya lo cuenta [mezcla]
         self._fader_prev = fader_val
 
         x = fader_val / 100.0
@@ -5252,6 +5303,7 @@ class AutoMix(QMainWindow):
             self.mix_timer.stop()
             self.crossfader.setValue(self.mix_to)
             self._plan = None
+            log("mezcla", f"completada · A {self.deck_a.position_seconds():.1f} s / B {self.deck_b.position_seconds():.1f} s")
             self._set_status("🎬 Mezcla completada")
             return
 
@@ -5313,6 +5365,7 @@ class AutoMix(QMainWindow):
 
     def _marca_cambiada(self, f):
         self._marca_frac = float(f)
+        _log_diferido("marca", "auto-enganche", f"marca en {self._marca_frac * 100:.1f} %")
         self._marca_disparada = False
         prim = self._deck_primario()
         if prim is not None and prim.analysis and prim.analysis.get("duration", 0) > 0:
@@ -5428,6 +5481,7 @@ class AutoMix(QMainWindow):
             self.btn_mix.setText(f"🎬 Mezclar ({self.spin_mix.value()}s) [F2]")
 
     def closeEvent(self, event):
+        log("programa", "cerrando AutoMix")
         try: CONSOLA.ocultar()
         except Exception: pass
         _cerrar_pool()
@@ -5440,10 +5494,27 @@ class AutoMix(QMainWindow):
         super().closeEvent(event)
 
 
+def _mensajes_qt(tipo, ctx, msg):
+    log("qt", msg)
+
+
 def main():
     app = QApplication(sys.argv)
+    try:
+        from PySide6.QtCore import qInstallMessageHandler, __version__ as _qv
+        qInstallMessageHandler(_mensajes_qt)             # los avisos internos de Qt también van a la consola
+        import platform
+        log("programa", f"AutoMix · Python {platform.python_version()} · PySide6 {_qv} · numpy {np.__version__} · {platform.platform()}")
+        try:
+            dev = sd.query_devices(sd.default.device[1] if sd.default.device[1] is not None and sd.default.device[1] >= 0 else None, "output")
+            log("audio", f"salida: {dev['name']} · {int(dev['default_samplerate'])} Hz · {dev['max_output_channels']} canales")
+        except Exception as e:
+            log("audio", f"no se pudo leer el dispositivo de salida ({e})")
+    except Exception:
+        pass
     w = AutoMix()
     w.show()
+    log("programa", f"listo · biblioteca {w.biblioteca.count()} tema(s) · duración de mezcla {w.spin_mix.value()} s")
     sys.exit(app.exec())
 
 
