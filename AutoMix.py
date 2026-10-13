@@ -1295,6 +1295,85 @@ class LogoAutoMix(QWidget):
         p.end()
 
 
+class VuMeter(QWidget):
+    """Medidor estéreo de la salida: LEDs verde → ámbar → rojo, pico retenido, y avisos de cuánto trabajan
+    el compensador de nivel (COMP) y el limitador (LIM)."""
+    DB_MIN = -48.0
+
+    def __init__(self, fuente):
+        super().__init__()
+        self.fuente = fuente
+        self.setMinimumHeight(40); self.setMaximumHeight(40)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._niv = [self.DB_MIN, self.DB_MIN]
+        self._pico = [self.DB_MIN, self.DB_MIN]
+        self._ret = [0.0, 0.0]
+        self._gr_lim = 0.0; self._gr_comp = 0.0
+        self._t = QTimer(self); self._t.timeout.connect(self._animar); self._t.start(33)
+
+    @staticmethod
+    def _db(x):
+        return 20.0 * math.log10(max(1e-5, x))
+
+    def _animar(self):
+        try:
+            pl, pr, glim, gcomp = self.fuente()
+        except Exception:
+            return
+        for i, v in enumerate((self._db(pl), self._db(pr))):
+            self._niv[i] = v if v > self._niv[i] else max(v, self._niv[i] - 1.1)       # sube al instante, baja con suavidad
+            if v >= self._pico[i]:
+                self._pico[i] = v; self._ret[i] = 28
+            elif self._ret[i] > 0:
+                self._ret[i] -= 1
+            else:
+                self._pico[i] = max(self.DB_MIN, self._pico[i] - 0.8)
+        self._gr_lim = self._db(glim); self._gr_comp = self._db(gcomp)
+        self.update()
+
+    def _x(self, db, x0, ancho):
+        return x0 + ancho * max(0.0, min(1.0, (db - self.DB_MIN) / (0.0 - self.DB_MIN)))
+
+    def paintEvent(self, ev):
+        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        f = QFont(self.font()); f.setPointSizeF(max(7.0, 7.5 * UI_ESCALA * FUENTE_BOOST)); f.setBold(True); p.setFont(f)
+        ancho_txt = max(60.0, min(110.0, w * 0.34))
+        x0 = 16.0; ancho = max(30.0, w - ancho_txt - x0 - 6)
+        alto_b = max(7.0, (h - 12) / 2.0 - 1)
+        for i, nombre in enumerate(("L", "R")):
+            y = 4 + i * (alto_b + 3)
+            p.setPen(QColor(TEMA["suave"])); p.drawText(QRectF(0, y - 2, x0 - 3, alto_b + 4), int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight), nombre)
+            p.setPen(QPen(QColor(TEMA["linea"]), 1)); p.setBrush(QBrush(QColor("#05070d")))
+            p.drawRoundedRect(QRectF(x0, y, ancho, alto_b), 3, 3)
+            xl = self._x(self._niv[i], x0, ancho)
+            g = QLinearGradient(x0, 0, x0 + ancho, 0)
+            g.setColorAt(0.0, QColor("#12d98a")); g.setColorAt(0.55, QColor("#22d3ff")); g.setColorAt(0.78, QColor("#ffb82e")); g.setColorAt(1.0, QColor("#ff3b4e"))
+            if xl > x0 + 1:
+                p.setPen(Qt.PenStyle.NoPen); p.setBrush(QBrush(g))
+                p.drawRoundedRect(QRectF(x0 + 1, y + 1, xl - x0 - 1, alto_b - 2), 2, 2)
+            p.setPen(QPen(QColor(5, 7, 13, 220), 1.4))                                   # separadores: efecto de LEDs
+            k = x0 + 5.0
+            while k < x0 + ancho:
+                p.drawLine(QPointF(k, y + 1), QPointF(k, y + alto_b - 1)); k += 5.0
+            xp = self._x(self._pico[i], x0, ancho)
+            if self._pico[i] > self.DB_MIN + 1:
+                p.setPen(QPen(QColor("#ffffff") if self._pico[i] < -1.0 else QColor(TEMA["rojo"]), 2)); p.drawLine(QPointF(xp, y), QPointF(xp, y + alto_b))
+        p.setPen(QPen(QColor(255, 255, 255, 45), 1))                                     # marcas -24 / -12 / -6 / 0
+        for db in (-24, -12, -6):
+            xx = self._x(db, x0, ancho); p.drawLine(QPointF(xx, h - 5), QPointF(xx, h - 2))
+        # avisos
+        xt = x0 + ancho + 8
+        mitad = (h - 6) / 2.0
+        comp = -self._gr_comp; lim = -self._gr_lim
+        on_c = comp > 0.4; on_l = lim > 0.4
+        p.setPen(QColor(TEMA["ambar"]) if on_c else QColor("#4a5473"))
+        p.drawText(QRectF(xt, 2, ancho_txt, mitad), int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), f"COMP  {-comp:+.1f}" if on_c else "COMP   0.0")
+        p.setPen(QColor(TEMA["rojo"]) if on_l else QColor("#4a5473"))
+        p.drawText(QRectF(xt, 2 + mitad, ancho_txt, mitad), int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), f"LIM    {-lim:+.1f}" if on_l else "LIM     0.0")
+        p.end()
+
+
 class EtiquetaElidida(QLabel):
     def __init__(self, texto=""):
         super().__init__()
@@ -1363,6 +1442,8 @@ class Deck(QFrame):
         efecto = QGraphicsDropShadowEffect(self)
         efecto.setBlurRadius(34); efecto.setOffset(0, 3); efecto.setColor(QColor(_rgba(color, 120)))
         self.setGraphicsEffect(efecto)
+        self._efecto = efecto
+        self._glow_paso = -1
         self.setFixedHeight(150)
 
         lay = QVBoxLayout(self)
@@ -1429,6 +1510,13 @@ class Deck(QFrame):
             f"Deck QSlider::sub-page:horizontal {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 {osc}, stop:1 {color}); border-radius:4px; }}"
             f"Deck QSlider::handle:horizontal {{ border:2px solid {color}; }}"
         )
+
+    def set_brillo(self, peso):
+        """Resplandor del deck según cuánto está sonando (0..1): se enciende el que entra y se apaga el que sale."""
+        peso = max(0.0, min(1.0, float(peso)))
+        c = QColor(self._acento)
+        self._efecto.setColor(QColor(c.red(), c.green(), c.blue(), int(45 + 150 * peso)))
+        self._efecto.setBlurRadius(18 + 26 * peso)
 
     def _marcar_cargado(self, v):
         self.setProperty("cargado", bool(v))
@@ -2244,6 +2332,11 @@ class GlobalMixer:
         self._g = None                    # ganancias actuales: a_lo, a_hi, b_lo, b_hi
         self._swap_espera = 0.0
         self.limitador = LimitadorSuave(sr)
+        self.comp_activo = True            # compensador de nivel (lo maneja la ventana)
+        self._comp = 1.0                   # ganancia actual del compensador (1 = sin efecto)
+        self._e = [0.0, 0.0, 0.0]          # energías suavizadas: deck A, deck B y la suma
+        self.comp_db = 0.0
+        self.vu = (0.0, 0.0, 1.0, 1.0)     # picos L, R (a la salida), ganancia del limitador y del compensador
 
     @staticmethod
     def _rampa(g0, g1, frames):
@@ -2309,6 +2402,31 @@ class GlobalMixer:
         g["a_lo"], g["b_lo"] = a1, b1                      # el traspaso queda hecho en este bloque
         return self._vec_paso(a0, a1, k, r, frames), self._vec_paso(b0, b1, k, r, frames)
 
+    TAU_E = 0.35        # ventana de energía (s)
+    TAU_ATK = 0.30      # cuánto tarda en bajar la suma cuando suenan los dos (s)
+    TAU_REL = 0.90      # y en volver cuando uno se va (s)
+    COMP_MIN = 0.56     # como máximo -5 dB
+
+    def _compensar(self, p_a, p_b, mix, frames):
+        """Mantiene el nivel de la suma parecido al del más fuerte de los dos: si suenan juntos (y a pleno)
+        la mezcla no sube sola. Se compara la energía de cada deck con la de la suma, así no depende de un nivel fijo."""
+        dt = frames / float(self.sr)
+        k = 1.0 - math.exp(-dt / self.TAU_E)
+        e = self._e
+        e[0] += (float(np.mean(p_a * p_a)) - e[0]) * k
+        e[1] += (float(np.mean(p_b * p_b)) - e[1]) * k
+        e[2] += (float(np.mean(mix * mix)) - e[2]) * k
+        obj = 1.0
+        if self.comp_activo and e[2] > 1e-8:
+            obj = max(self.COMP_MIN, min(1.0, math.sqrt(max(e[0], e[1]) / e[2])))
+        c0 = self._comp
+        c1 = c0 + (obj - c0) * (1.0 - math.exp(-dt / (self.TAU_ATK if obj < c0 else self.TAU_REL)))
+        self._comp = c1
+        self.comp_db = 20.0 * math.log10(max(1e-3, c1))
+        if abs(c1 - 1.0) < 1e-4 and abs(c0 - 1.0) < 1e-4:
+            return mix
+        return mix * np.linspace(c0, c1, frames, dtype=np.float32)[:, None]
+
     def _mezclar(self, a, b, frames, pa, pb):
         da, db = self.deck_a, self.deck_b
         tg = {"a_lo": da.vol_lo, "a_hi": da.vol_hi, "b_lo": db.vol_lo, "b_hi": db.vol_hi}
@@ -2319,12 +2437,18 @@ class GlobalMixer:
             alo, ahi = self._xo_a.split(a)
             blo, bhi = self._xo_b.split(b)
             ga_lo, gb_lo = self._ganancias_bajos(tg, frames, pa, pb)
-            mix = (alo * ga_lo + ahi * self._rampa(g["a_hi"], tg["a_hi"], frames)
-                   + blo * gb_lo + bhi * self._rampa(g["b_hi"], tg["b_hi"], frames))
+            p_a = alo * ga_lo + ahi * self._rampa(g["a_hi"], tg["a_hi"], frames)
+            p_b = blo * gb_lo + bhi * self._rampa(g["b_hi"], tg["b_hi"], frames)
         else:
-            mix = a * self._rampa(g["a_hi"], tg["a_hi"], frames) + b * self._rampa(g["b_hi"], tg["b_hi"], frames)
+            p_a = a * self._rampa(g["a_hi"], tg["a_hi"], frames)
+            p_b = b * self._rampa(g["b_hi"], tg["b_hi"], frames)
             g["a_lo"], g["b_lo"] = tg["a_hi"], tg["b_hi"]
         g["a_hi"], g["b_hi"] = tg["a_hi"], tg["b_hi"]
+        mix = p_a + p_b
+        try:
+            mix = self._compensar(p_a, p_b, mix, frames)
+        except Exception:
+            self._comp = 1.0
         return mix
 
     def start(self):
@@ -2396,6 +2520,10 @@ class GlobalMixer:
             self._gain_act = g1
         elif g1 != 1.0:
             mix = mix * g1
+        try:
+            self.vu = (float(np.abs(mix[:, 0]).max()), float(np.abs(mix[:, 1]).max()), float(self.limitador.g), float(self._comp))
+        except Exception:
+            pass
         outdata[:] = mix.astype(np.float32)
 
 
@@ -2467,7 +2595,7 @@ class GraficoCruce(QWidget):
         super().__init__()
         self.punto_a = DEF_PUNTO_A; self.punto_b = DEF_PUNTO_B; self.avance = None
         self.punto_s = DEF_PUNTO_S; self.bandas = False
-        self.setMinimumHeight(75)
+        self.setMinimumHeight(62)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def actualizar(self, pa, pb, avance=None, ps=None, bandas=False, fa=1.0):
@@ -2556,6 +2684,11 @@ class PanelCruce(QFrame):
         self.chk_recetas.setChecked(ventana.recetas)
         self.chk_recetas.toggled.connect(ventana.set_recetas)
         lay.addWidget(self.chk_recetas)
+        self.chk_comp = QCheckBox("⚖ Compensar nivel")
+        self.chk_comp.setToolTip("Cuando suenan los dos temas a la vez, la suma suena más fuerte que cada uno.\nEsto baja un poco el total (hasta -5 dB, suave y automático) para que el volumen se mantenga parejo en la mezcla.")
+        self.chk_comp.setChecked(ventana.comp_nivel)
+        self.chk_comp.toggled.connect(ventana.set_comp)
+        lay.addWidget(self.chk_comp)
         self.sl_s, self.lv_s = fila("Bajo (cambia):", TEMA["verde"], ventana.punto_s, "Momento de la mezcla en que el bajo pasa del tema que sale al que entra (en la línea de compás más próxima). 0 % = el nuevo trae su bajo desde el principio · 95 % = el viejo mantiene el bajo casi hasta el final.")
         self.lbl_dur = QLabel(); self.lbl_dur.hide()
         b_def = QPushButton("Valores por defecto"); b_def.clicked.connect(self._defecto)
@@ -3461,6 +3594,7 @@ class AutoMix(QMainWindow):
         self.punto_s = float(cfg.get("punto_s", DEF_PUNTO_S))
         self.cruce_bandas = bool(cfg.get("cruce_bandas", True))
         self.recetas = bool(cfg.get("recetas", True))
+        self.comp_nivel = bool(cfg.get("comp_nivel", True))
         self._plan = None                 # receta de la mezcla en curso: dict(pa, pb, ps, fa, nombre) o None
         self._cf_dir = "AB"
         self.carga_auto = True
@@ -3550,6 +3684,7 @@ class AutoMix(QMainWindow):
         root.addLayout(decks_row)
 
         self.mixer = GlobalMixer(self.deck_a, self.deck_b, sr=44100, blocksize=1024)
+        self.mixer.comp_activo = self.comp_nivel
         self.mixer.start()
 
         cf_row = QHBoxLayout()           # el crossfader va en el panel de la derecha de los deslizadores
@@ -3836,6 +3971,8 @@ class AutoMix(QMainWindow):
         f_vol = QHBoxLayout(); f_vol.addWidget(QLabel("🔊 Volumen")); f_vol.addWidget(self.sld_master, 1); f_vol.addWidget(self.lbl_master)
         self.crossfader.setToolTip("Crossfader A ↔ B (volumen + BPM compartido)")
         der.addLayout(self._cf_row)
+        self.vu_meter = VuMeter(lambda: self.mixer.vu)
+        der.addWidget(self.vu_meter)
         der.addStretch(1)
         der.addLayout(f_vol)                      # el volumen va debajo del fader, a la altura de la fila de Agudos
         g.addLayout(der, 6, 7, 6, 4)
@@ -4003,6 +4140,12 @@ class AutoMix(QMainWindow):
             nombre = "Entrada instrumental bajo la voz vieja"
             pb, ps, pa = 0.0, 0.3, 0.65                  # el nuevo entra completo; la voz vieja sigue un rato
         return {"pa": float(pa), "pb": float(pb), "ps": float(ps), "fa": float(fa), "nombre": nombre}
+
+    def set_comp(self, v):
+        self.comp_nivel = bool(v)
+        guardar_config(comp_nivel=self.comp_nivel)
+        if hasattr(self, "mixer"):
+            self.mixer.comp_activo = self.comp_nivel
 
     def set_recetas(self, v):
         self.recetas = bool(v)
@@ -4979,6 +5122,10 @@ class AutoMix(QMainWindow):
         self.deck_a.tick()
         self.deck_b.tick()
         self._mb_actualizar_barras()
+        try:
+            self._animar_cruce()
+        except Exception:
+            import traceback; traceback.print_exc()
         prim = self._deck_primario()
         rutas = (self.deck_a.path, self.deck_b.path, self.biblioteca.count(), prim.path if prim is not None else None,
                  self._clave_de(prim))
@@ -5001,6 +5148,37 @@ class AutoMix(QMainWindow):
         except Exception:
             import traceback; traceback.print_exc()
         self.timeline.redraw()
+
+    _QSS_MIX_BASE = (
+        "QPushButton { background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #ffd84a, stop:1 #ff9a00); color:#2a1700; font-weight:bold;"
+        " border:1px solid #ffe08a; border-radius:11px; }"
+        "QPushButton:hover { background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #ffe473, stop:1 #ffae2e); }"
+        "QPushButton:pressed { background:#d98400; padding-top:2px; }"
+        "QPushButton:disabled { background:#3a3322; color:#7a7155; border-color:#4a422c; }")
+
+    def _animar_cruce(self):
+        """Los decks brillan según cuánto suenan y el botón Mezclar muestra el avance de la mezcla."""
+        for d in (self.deck_a, self.deck_b):
+            peso = max(d.vol_hi, d.vol_lo) if d.playing else 0.0
+            paso = int(round(peso * 10))
+            if paso != d._glow_paso:
+                d._glow_paso = paso
+                d.set_brillo(paso / 10.0)
+        mezclando = self.mix_timer.isActive() or self.mix_pausa_timer.isActive()
+        if mezclando and self.mix_steps_total > 0:
+            pct = max(0, min(100, int(round(100.0 * self.mix_steps_done / self.mix_steps_total))))
+            clave = pct // 2
+            if clave != getattr(self, "_mix_prog_clave", None):
+                self._mix_prog_clave = clave
+                p = clave * 0.02
+                self.btn_mix.setStyleSheet(
+                    "QPushButton { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #ffd84a, stop:%.3f #ff9a00, stop:%.3f #2b2112, stop:1 #1c160b);"
+                    " color:#ffffff; font-weight:bold; border:1px solid #ffe08a; border-radius:11px; }" % (p, min(1.0, p + 0.002)))
+                self.btn_mix.setText(f"⏳ Mezclando…  {pct} %")
+        elif getattr(self, "_mix_prog_clave", None) is not None:
+            self._mix_prog_clave = None
+            self.btn_mix.setStyleSheet(self._QSS_MIX_BASE)
+            self.btn_mix.setText(f"🎬 Mezclar ({self.spin_mix.value()}s) [F2]")
 
     def closeEvent(self, event):
         try: CONSOLA.ocultar()
