@@ -3144,10 +3144,10 @@ class AutoMix(QMainWindow):
         self._f_dur = f_dur                       # el botón de la consola se agrega acá al lado
         der.addLayout(f_dur)
         f_vol = QHBoxLayout(); f_vol.addWidget(QLabel("🔊 Volumen")); f_vol.addWidget(self.sld_master, 1); f_vol.addWidget(self.lbl_master)
-        der.addLayout(f_vol)
         self.crossfader.setToolTip("Crossfader A ↔ B (volumen + BPM compartido)")
         der.addLayout(self._cf_row)
         der.addStretch(1)
+        der.addLayout(f_vol)                      # el volumen va debajo del fader, a la altura de la fila de Agudos
         g.addLayout(der, 6, 7, 6, 4)
         self.chk_mb.toggled.connect(self._mb_cambio)
         for sl in (self.sld_mb, self.sld_lim, self.sld_vel, self.sld_golpe, self.sld_medios, self.sld_agudos):
