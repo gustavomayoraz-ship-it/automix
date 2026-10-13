@@ -5380,6 +5380,7 @@ class AutoMix(QMainWindow):
 
     def _marca_cambiada(self, f):
         self._marca_frac = float(f)
+        self._marca_pendiente = False
         _log_diferido("marca", "auto-enganche", f"marca en {self._marca_frac * 100:.1f} %")
         self._marca_disparada = False
         prim = self._deck_primario()
@@ -5403,6 +5404,7 @@ class AutoMix(QMainWindow):
 
         if prim is not self._ultimo_deck_primario:
             self._ultimo_deck_primario = prim
+            self._marca_pendiente = False
             self._marca_disparada = False
             self._ultimo_prog_primario = 0.0
 
@@ -5418,14 +5420,25 @@ class AutoMix(QMainWindow):
 
         if self._marca_frac >= 0 and not self._marca_disparada:
             if self._ultimo_prog_primario < self._marca_frac <= prog:
-                self._marca_disparada = True
+                self._marca_pendiente = True; self._marca_t_reintento = 0.0
+                log("auto-enganche", f"marca {self._marca_frac * 100:.1f} % cruzada en {fmt_time(seg)} de {fmt_time(dur)}")
                 self._set_status(
                     f"⚓ Auto-enganche disparado (marca {self._marca_frac * 100:.1f}%) → mezcla"
                 )
-                try:
-                    self._disparar_mezcla_auto(exacto=True)      # la marca roja manda: se engancha JUSTO ahí, sin esperar frase
-                except Exception:
-                    import traceback; traceback.print_exc()
+            if getattr(self, "_marca_pendiente", False):
+                # Si al cruzar la marca no se pudo arrancar (el otro deck aún sin análisis/tonalidad, sin tema cargado…),
+                # se reintenta cada segundo hasta que la mezcla arranque (antes se perdía y el tema se pasaba de largo).
+                ahora = time.monotonic()
+                if ahora >= getattr(self, "_marca_t_reintento", 0.0):
+                    self._marca_t_reintento = ahora + 1.0
+                    try:
+                        self._disparar_mezcla_auto(exacto=True)      # la marca roja manda: se engancha JUSTO ahí, sin esperar frase
+                    except Exception:
+                        import traceback; traceback.print_exc()
+                    if (self.mix_timer.isActive() or self.mix_pausa_timer.isActive()
+                            or getattr(self, "_mix_esperando", False) or getattr(self, "_frase_armada", False)):
+                        self._marca_pendiente = False; self._marca_disparada = True
+                        log("auto-enganche", "mezcla arrancada")
 
         self._ultimo_prog_primario = prog
 
