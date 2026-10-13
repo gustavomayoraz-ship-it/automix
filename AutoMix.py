@@ -316,7 +316,7 @@ class ConsolaOculta:
             try:
                 self._destino.write(t); self._destino.flush()
             except Exception:
-                pass
+                self._cerrar_visor()                  # la cerraron con la X
         else:
             o = self._orig.get(nombre)
             if o is not None and not self._propia:
@@ -324,77 +324,90 @@ class ConsolaOculta:
                 except Exception: pass
 
     # ---- abrir / cerrar ----
+    # La consola se muestra en una ventana APARTE (un proceso visor que recibe el texto por una tubería): así la X de
+    # esa ventana se puede usar libremente: solo cierra el visor y el programa sigue como si nada.
+    _VISOR = (
+        "import sys, os\n"
+        "try:\n"
+        "    import ctypes\n"
+        "    ctypes.windll.kernel32.SetConsoleTitleW('AutoMix - consola (se puede cerrar con la X)')\n"
+        "    ctypes.windll.kernel32.SetConsoleOutputCP(65001)\n"
+        "except Exception:\n"
+        "    pass\n"
+        "while True:\n"
+        "    d = os.read(0, 65536)\n"
+        "    if not d:\n"
+        "        break\n"
+        "    sys.stdout.buffer.write(d); sys.stdout.buffer.flush()\n"
+    )
+
+    def _ejecutable_visor(self):
+        exe = sys.executable or "python"
+        base = os.path.basename(exe).lower()
+        if base == "pythonw.exe":
+            cand = os.path.join(os.path.dirname(exe), "python.exe")
+            if os.path.exists(cand):
+                return cand
+        return exe
+
     def mostrar(self):
         if not self.es_windows or self.visible:
-            return self.visible
-        if self._modo == "ventana":
-            try:
-                import ctypes
-                u32 = ctypes.windll.user32
-                try:
-                    hmenu = u32.GetSystemMenu(self._hwnd, False)
-                    u32.DeleteMenu(hmenu, 0xF060, 0)
-                    ctypes.windll.kernel32.SetConsoleCtrlHandler(None, True)
-                except Exception:
-                    pass
-                u32.ShowWindow(self._hwnd, 5)
-                self.visible = True
-            except Exception:
-                self.visible = False
             return self.visible
         if self._modo == "terminal":
             return False
         try:
-            import ctypes
-            k32 = ctypes.windll.kernel32; u32 = ctypes.windll.user32
-            if not k32.GetConsoleWindow():
-                k32.AllocConsole()
-            hwnd = k32.GetConsoleWindow()
-            k32.SetConsoleOutputCP(65001)
-            k32.SetConsoleTitleW("AutoMix — consola (se cierra con el botón 🖥, no con la X)")
-            try:
-                k32.SetConsoleCtrlHandler(None, True)         # Ctrl+C acá no cierra el programa
-                hmenu = u32.GetSystemMenu(hwnd, False)
-                u32.DeleteMenu(hmenu, 0xF060, 0)               # sin botón X: cerrarla mataría el programa
-            except Exception:
-                pass
-            if hwnd:
-                u32.ShowWindow(hwnd, 5)
-            self._destino = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
-            self._destino.write("".join(self.buffer))
-            self._destino.flush()
+            import subprocess
+            self._proc = subprocess.Popen([self._ejecutable_visor(), "-c", self._VISOR], stdin=subprocess.PIPE,
+                                          creationflags=0x00000010)        # CREATE_NEW_CONSOLE
+            self._destino = _TuberiaTexto(self._proc.stdin)
+            self._destino.write("".join(self.buffer)); self._destino.flush()
             self.visible = True
         except Exception:
-            self.visible = False
+            self._proc = None; self._destino = None; self.visible = False
         return self.visible
+
+    def sondear(self):
+        """Devuelve si la consola sigue abierta (si el usuario la cerró con la X, la da por cerrada)."""
+        if self.visible and getattr(self, "_proc", None) is not None and self._proc.poll() is not None:
+            self._cerrar_visor()
+        return self.visible
+
+    def _cerrar_visor(self):
+        try:
+            if self._destino: self._destino.close()
+        except Exception:
+            pass
+        self._destino = None
+        p = getattr(self, "_proc", None)
+        self._proc = None
+        if p is not None:
+            try:
+                if p.poll() is None: p.terminate()
+            except Exception:
+                pass
+        self.visible = False
 
     def ocultar(self):
         if not self.es_windows or not self.visible:
             return
-        if self._modo == "ventana":
-            try:
-                import ctypes
-                ctypes.windll.user32.ShowWindow(self._hwnd, 0)
-            except Exception:
-                pass
-            self.visible = False
-            return
-        try:
-            import ctypes
-            try:
-                if self._destino: self._destino.close()
-            except Exception:
-                pass
-            self._destino = None
-            self.visible = False
-            ctypes.windll.kernel32.FreeConsole()
-        except Exception:
-            pass
+        self._cerrar_visor()
 
     def alternar(self):
         if self.visible: self.ocultar()
         else: self.mostrar()
         return self.visible
+
+
+class _TuberiaTexto:
+    """Escribe texto (utf-8) en la tubería hacia la ventana visor de la consola."""
+    def __init__(self, f):
+        self._f = f
+    def write(self, t):
+        self._f.write(t.encode("utf-8", "replace"))
+    def flush(self):
+        self._f.flush()
+    def close(self):
+        self._f.close()
 
 
 class _TeeConsola:
@@ -2562,6 +2575,8 @@ except Exception:
     pass
 DEF_PUNTO_A = 0.0      # valores por defecto de la forma de cruce
 DEF_PUNTO_B = 0.15
+CAIDA_A = 0.20         # por bandas: el que sale cae casi en picada, en este tramo de la mezcla a partir de A
+UMBRAL_CAIDA = 0.30   # hasta este A el que sale baja con el arco completo; después se recorta
 DEF_PUNTO_S = 0.5      # por bandas: en qué momento de la mezcla se traspasa el bajo (50 % = a la mitad)
 DEF_MARCA = 0.50      # marca de auto-enganche: SIEMPRE visible (por defecto a la mitad del tema)
 
@@ -2580,14 +2595,27 @@ def perfil_cruce_ab(t, punto_a, punto_b):
     return vs, ve
 
 
-def perfil_cruce_bandas(t, punto_a, punto_b, punto_s, rampa=0.12, fin_a=1.0):
+def caida_a(pa):
+    """Duración de la caída del que sale (por bandas). Hasta A=30 % es el arco de siempre (desde A hasta el final);
+    pasado el 30 % se va recortando hasta caer casi en picada (a A=40 % dura CAIDA_A)."""
+    if pa <= UMBRAL_CAIDA:
+        return 1.0 - pa
+    k = (pa - UMBRAL_CAIDA) / (0.40 - UMBRAL_CAIDA)
+    return max(0.12, (1.0 - UMBRAL_CAIDA) + k * (CAIDA_A - (1.0 - UMBRAL_CAIDA)))
+
+
+def perfil_cruce_bandas(t, punto_a, punto_b, punto_s, rampa=0.12, fin_a=None):
     """Cruce por bandas. Devuelve (sale_medios_agudos, entra_medios_agudos, sale_graves, entra_graves).
     · El entrante entra a nivel PLENO: en `punto_b` sube de 0 a 100 % en `rampa` de la mezcla (no se queda atenuado).
     · El que sale conserva sus medios/agudos hasta `punto_a` y ahí se va con un coseno.
     · El bajo es de uno solo a la vez: el del que sale se traspasa al del que entra en `punto_s` (el mezclador lo
       hace justo en la línea del compás)."""
     pa = max(0.0, min(0.97, punto_a)); pb = max(0.0, min(0.97, punto_b)); ps = max(0.0, min(0.97, punto_s))
-    fa = max(pa + 0.03, min(1.0, fin_a))                  # hasta dónde se va el que sale (por defecto, al final)
+    if fin_a is None:
+        fa = pa + caida_a(pa)
+    else:
+        fa = fin_a
+    fa = max(pa + 0.03, min(1.0, fa))                     # hasta dónde se va el que sale
     vs = 1.0 if t <= pa else math.cos(min(1.0, (t - pa) / (fa - pa)) * (math.pi / 2))
     r = max(0.02, min(rampa, 1.0 - pb))
     ve = 0.0 if t <= pb else math.sin(min(1.0, (t - pb) / r) * (math.pi / 2))
@@ -2620,7 +2648,7 @@ class GraficoCruce(QWidget):
         self.setMinimumHeight(62)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-    def actualizar(self, pa, pb, avance=None, ps=None, bandas=False, fa=1.0, simple=False):
+    def actualizar(self, pa, pb, avance=None, ps=None, bandas=False, fa=None, simple=False):
         self.simple = bool(simple)
         self.punto_a, self.punto_b, self.avance = pa, pb, avance
         self.fin_a = fa
@@ -2646,7 +2674,7 @@ class GraficoCruce(QWidget):
             if self.simple:
                 vs, ve = math.cos(t * math.pi / 2.0), math.sin(t * math.pi / 2.0); ls, le = vs, ve
             elif self.bandas:
-                vs, ve, ls, le = perfil_cruce_bandas(t, self.punto_a, self.punto_b, self.punto_s, fin_a=getattr(self, "fin_a", 1.0))
+                vs, ve, ls, le = perfil_cruce_bandas(t, self.punto_a, self.punto_b, self.punto_s, fin_a=getattr(self, "fin_a", None))
             else:
                 vs, ve = perfil_cruce_ab(t, self.punto_a, self.punto_b); ls, le = vs, ve
             x = x0 + (x1 - x0) * t
@@ -3736,9 +3764,10 @@ class AutoMix(QMainWindow):
         decks_ab.addWidget(self.deck_a, stretch=1)
         decks_ab.addWidget(self.deck_b, stretch=1)
         izq.addLayout(decks_ab)
-        izq.addStretch(1)
+        izq.addStretch(1)                        # la duración queda centrada en el hueco entre los decks y el panel de abajo
         self._fila_duracion = QHBoxLayout(); self._fila_duracion.setContentsMargins(0, 0, 0, 0); self._fila_duracion.setSpacing(6)
         izq.addLayout(self._fila_duracion)       # a la altura del botón "Valores por defecto", justo debajo de los dos decks
+        izq.addStretch(1)
         decks_row.addLayout(izq, stretch=1)
         decks_row.addWidget(self.panel_cruce, alignment=Qt.AlignmentFlag.AlignTop)
         root.addLayout(decks_row)
@@ -3811,9 +3840,13 @@ class AutoMix(QMainWindow):
         fila_estado.addStretch(1)
         self.btn_consola = QPushButton("🖥")
         self.btn_consola.setCheckable(True)
-        self.btn_consola.setFixedSize(34, 24)
+        self.btn_consola.setFixedSize(76, 52)
+        self.btn_consola.setStyleSheet("QPushButton { font-size:30px; padding:0px; }")
         self.btn_consola.setToolTip("Mostrar / ocultar la consola (todo lo que hace el programa, con hora)")
         self.btn_consola.clicked.connect(self._alternar_consola)
+        self._t_consola = QTimer(self); self._t_consola.setInterval(600)       # si la cerraron con la X, el botón se suelta
+        self._t_consola.timeout.connect(lambda: self.btn_consola.setChecked(CONSOLA.sondear()) if CONSOLA._modo != "terminal" else None)
+        self._t_consola.start()
         if not CONSOLA.es_windows:
             self.btn_consola.setVisible(False)
         self._f_dur.insertWidget(self._f_dur.count() - 1, self.btn_consola)   # al costado de Duración, mismo tamaño
@@ -4730,7 +4763,7 @@ class AutoMix(QMainWindow):
         if CONSOLA._modo == "terminal":
             self._set_status("🖥 Lo abriste desde una terminal: ahí mismo ves todo lo que hace")
             return
-        self._set_status("🖥 Consola abierta (se cierra con este mismo botón)" if visible else "🖥 Consola oculta")
+        self._set_status("🖥 Consola abierta (se cierra con este botón o con su X)" if visible else "🖥 Consola oculta")
 
     def _set_status(self, text):
         self.lbl_status.setText(text)
