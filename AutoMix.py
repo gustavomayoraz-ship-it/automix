@@ -3863,7 +3863,7 @@ class AutoMix(QMainWindow):
         split.setStretchFactor(0, 0); split.setStretchFactor(1, 1)
         split.setSizes([470, 1090])
         split.setChildrenCollapsible(False)
-        panel_lib.setMinimumWidth(170)
+        panel_lib.setMinimumWidth(340)
         root = QVBoxLayout(central)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
