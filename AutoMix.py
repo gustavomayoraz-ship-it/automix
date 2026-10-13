@@ -463,6 +463,8 @@ from PySide6.QtGui import (
 # 2) UTILIDADES Y ANÁLISIS
 # =====================================================================
 UI_ESCALA = 1.0
+ESC_MIN = 0.6         # escala más chica de la interfaz = ventana más chica posible
+FUENTE_BOOST = 1.3     # multiplicador SOLO de las letras (1.0 = tamaño original); subilo/bajalo a gusto
 SUPPORTED = (".mp3", ".wav", ".flac", ".ogg", ".m4a")
 
 CF_BAJA_DESDE = 0.75
@@ -1935,6 +1937,7 @@ class GlobalMixer:
 CONFIG_JSON = Path(__file__).parent / "cache" / "config.json"
 DEF_PUNTO_A = 0.50
 DEF_PUNTO_B = 0.0
+DEF_MARCA = 0.85      # marca de auto-enganche: SIEMPRE visible (por defecto al 85 % del tema)
 
 
 def perfil_cruce_ab(t, punto_a, punto_b):
@@ -2065,7 +2068,7 @@ class BarraProgresoConMarca(QWidget):
         self.progreso = 0.0
         self.prog_seg = 0.0
         self.dur = 0.0
-        self.marca = -1.0
+        self.marca = DEF_MARCA
         self._arrastrando = False
         self._arrastrando_marca = False
         self.setMouseTracking(True)
@@ -2083,7 +2086,8 @@ class BarraProgresoConMarca(QWidget):
             self.update()
 
     def set_marca(self, m):
-        self.marca = float(m)
+        m = float(m)
+        self.marca = m if m >= 0 else DEF_MARCA
         self.update()
 
     def _x_de_frac(self, f):
@@ -2133,7 +2137,7 @@ class BarraProgresoConMarca(QWidget):
             txt = f"{fmt_time(self.prog_seg)}  /  {fmt_time(self.dur)}"
         else:
             txt = "--:--  /  --:--"
-        f = self.font(); f.setPointSizeF(10.5); f.setBold(True); p.setFont(f)
+        f = self.font(); f.setPointSizeF(max(12.0, 10.5 * UI_ESCALA * FUENTE_BOOST)); f.setBold(True); p.setFont(f)
         p.setPen(QPen(QColor("#fff"), 1))
         p.drawText(m + 6, y_prog_t, w - 2 * m - 12, hh,
                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, txt)
@@ -2170,8 +2174,8 @@ class BarraProgresoConMarca(QWidget):
         self._arrastrando = False
 
     def mouseDoubleClickEvent(self, ev):
-        self.marca = -1.0
-        self.marca_cambiada.emit(-1.0)
+        self.marca = DEF_MARCA                  # la marca nunca se borra: vuelve a su posición por defecto
+        self.marca_cambiada.emit(DEF_MARCA)
         self.update()
 
     def _set_marca_desde_x(self, x):
@@ -2218,7 +2222,7 @@ class Biblioteca(QListWidget):
         self.setDefaultDropAction(Qt.DropAction.CopyAction)
         self.setUniformItemSizes(True)
         self.setAlternatingRowColors(True)
-        f = self.font(); f.setPointSize(9); self.setFont(f)
+        f = self.font(); f.setPointSize(int(round(9 * FUENTE_BOOST))); self.setFont(f)
         self._rutas = set()
         self._cola = set()         # temas esperando su análisis (se muestran con ⏳)
 
@@ -2393,7 +2397,7 @@ class UnifiedTimeline(QGraphicsView):
         self.setStyleSheet("background:#0a0a0a; border:1px solid #333;")
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setMinimumHeight(240)
+        self.setMinimumHeight(150)
 
         self.px_per_s = 40.0
         self._dragging = False
@@ -2457,7 +2461,7 @@ class UnifiedTimeline(QGraphicsView):
             self.scene_.addItem(ln)
             txt = QGraphicsSimpleTextItem(fmt_time(t))
             txt.setBrush(QBrush(QColor(90, 90, 90)))
-            f = QFont(); f.setPointSizeF(max(4.0, 7 * UI_ESCALA)); txt.setFont(f)
+            f = QFont(); f.setPointSizeF(max(9.0, 8 * UI_ESCALA * FUENTE_BOOST)); txt.setFont(f)
             txt.setPos(x + 2, 2)
             self.scene_.addItem(txt)
             t += step_s
@@ -2795,7 +2799,9 @@ class AutoMix(QMainWindow):
         self._fader_prev = None
         self._carga_pendiente = False
         self._mix_pausa_hecha = False
-        self._marca_frac = float(cfg.get("marca_frac", -1.0))
+        self._marca_frac = float(cfg.get("marca_frac", DEF_MARCA))
+        if self._marca_frac < 0:
+            self._marca_frac = DEF_MARCA
         self._marca_disparada = False
         self._ultimo_prog_primario = 0.0
         self._ultimo_deck_primario = None
@@ -3019,10 +3025,12 @@ class AutoMix(QMainWindow):
         # Tamaño "natural" (escala 1.0) = lo que mide el contenido de verdad. La escala sale de
         # comparar la ventana con ese tamaño, así el contenido SIEMPRE entra en la ventana
         # (antes se usaba un 1560x850 fijo y, al agregar paneles, el mínimo pasaba la pantalla).
-        self._aplicar_escala(0.6)
+        # El tamaño inicial es el MÍNIMO que soporta el formulario con las letras ya en su tamaño normal
+        # (escala 1.0): ni más grande, ni con letras diminutas.
+        self._aplicar_escala(ESC_MIN)
         mh = self.minimumSizeHint()
-        self.ESC_BASE_W = mh.width() / 0.6 * 1.05      # +5 % de holgura: el mínimo no crece exacto con la escala
-        self.ESC_BASE_H = mh.height() / 0.6 * 1.05
+        self.ESC_BASE_W = mh.width() / ESC_MIN * 1.05    # +5 % de holgura: el mínimo no crece exacto con la escala
+        self.ESC_BASE_H = mh.height() / ESC_MIN * 1.05
         self.resize(mh)
         QTimer.singleShot(0, self._ir_al_minimo)
 
@@ -3419,12 +3427,6 @@ class AutoMix(QMainWindow):
     def _ir_al_minimo(self):
         self.resize(self.minimumSizeHint())
         self._escalar_segun_ventana()
-        # al iniciar, la lista de temas es el doble de ancha (la ventana crece lo mismo que la lista)
-        lw = self.split.sizes()[0]
-        if lw > 0:
-            self.resize(self.width() + lw, self.height())
-            self._ratio_lista = (2.0 * lw) / float(self.width())
-            self._escalar_segun_ventana()
         self._ajustar_a_pantalla()
 
     def _ajustar_a_pantalla(self):
@@ -3435,7 +3437,7 @@ class AutoMix(QMainWindow):
             ag = scr.availableGeometry()
             fg, g = self.frameGeometry(), self.geometry()
             marco_w, marco_h = fg.width() - g.width(), fg.height() - g.height()
-            w = min(self.width(), ag.width() - marco_w)
+            w = min(self.width(), ag.width() - marco_w)       # nunca más grande que la pantalla
             h = min(self.height(), ag.height() - marco_h)
             self.resize(w, h)
             self.move(ag.left() + (ag.width() - (w + marco_w)) // 2,
@@ -3464,7 +3466,7 @@ class AutoMix(QMainWindow):
 
     def _escalar_segun_ventana(self):
         s = min(self.width() / self.ESC_BASE_W, self.height() / self.ESC_BASE_H)
-        s = max(0.6, min(1.6, int(s * 50) / 50.0))      # hacia abajo: nunca más grande que la ventana
+        s = max(ESC_MIN, min(1.6, int(s * 50) / 50.0))      # hacia abajo: nunca más grande que la ventana
         if abs(s - self._esc_actual) > 1e-9:
             self._aplicar_escala(s)
         tot = sum(self.split.sizes())
@@ -3479,8 +3481,8 @@ class AutoMix(QMainWindow):
         for wd, fb, pt, px in self._esc_fuentes:
             try:
                 nf = QFont(fb)
-                if pt > 0: nf.setPointSizeF(max(5.0, pt * s))
-                else: nf.setPixelSize(max(6, int(round(px * s))))
+                if pt > 0: nf.setPointSizeF(max(7.0, pt * s * FUENTE_BOOST))
+                else: nf.setPixelSize(max(9, int(round(px * s * FUENTE_BOOST))))
                 wd.setFont(nf)
             except RuntimeError:
                 pass
@@ -3490,7 +3492,7 @@ class AutoMix(QMainWindow):
                 wd.setMinimumSize(r(minw), r(minh))
                 wd.setMaximumSize(maxw if maxw >= MAX else r(maxw), maxh if maxh >= MAX else r(maxh))
                 if "font-size" in ss:
-                    nuevo = re.sub(r"font-size:\s*(\d+(?:\.\d+)?)px", lambda m: f"font-size:{max(6, r(float(m.group(1))))}px", ss)
+                    nuevo = re.sub(r"font-size:\s*(\d+(?:\.\d+)?)px", lambda m: f"font-size:{max(9, int(round(float(m.group(1)) * s * FUENTE_BOOST)))}px", ss)
                     if nuevo != wd.styleSheet(): wd.setStyleSheet(nuevo)
             except RuntimeError:
                 pass
@@ -3500,6 +3502,8 @@ class AutoMix(QMainWindow):
                 if sp >= 0: lay.setSpacing(r(sp))
             except RuntimeError:
                 pass
+        for gb in self.findChildren(QGroupBox):          # los títulos de grupo se cortaban: recalcular su ancho con la letra nueva
+            gb.setTitle(gb.title()); gb.updateGeometry(); gb.update()
 
     def _filtrar_biblioteca(self, txt):
         t = txt.strip().lower()
@@ -3937,10 +3941,7 @@ class AutoMix(QMainWindow):
     def _actualizar_lbl_marca(self):
         if not hasattr(self, "lbl_marca"):
             return
-        if self._marca_frac < 0:
-            self.lbl_marca.setText("Sin marca — clic sobre la barra\n(doble clic para borrar)")
-        else:
-            self.lbl_marca.setText(f"⚓ Marca: {self._marca_frac * 100:.1f}%\nDoble clic para borrar")
+        self.lbl_marca.setText(f"⚓ Marca: {self._marca_frac * 100:.1f}%\nDoble clic para restablecer")
 
     def _tick_auto_enganche(self):
         prim = self._deck_primario()
