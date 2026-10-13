@@ -466,7 +466,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QAbstractItemView, QSpinBox, QDialog, QCheckBox, QSizePolicy,
     QLayout, QScrollBar, QAbstractScrollArea, QProgressBar, QGridLayout, QGraphicsDropShadowEffect
 )
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, QPointF, QMimeData, QUrl, QSize, QRectF
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QPointF, QMimeData, QUrl, QSize, QRectF, QPoint
 from PySide6.QtGui import (
     QGuiApplication, QDragEnterEvent, QDropEvent, QColor, QPen, QPainter, QBrush,
     QPolygonF, QFont, QCursor, QKeyEvent, QShortcut, QKeySequence,
@@ -1426,6 +1426,38 @@ class EtiquetaElidida(QLabel):
             self._recortar()
 
 
+class RelojReset(QWidget):
+    """Reloj chiquito que aparece mientras el tempo vuelve al 100 %: el arco se llena y la aguja da la vuelta."""
+    def __init__(self, parent, color):
+        super().__init__(parent)
+        self._color = QColor(color); self._k = 0.0
+        self.setFixedSize(46, 46)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.hide()
+
+    def set_progreso(self, k):
+        self._k = max(0.0, min(1.0, k)); self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(3, 3, -3, -3)
+        p.setPen(QPen(QColor(255, 255, 255, 40), 1.4)); p.setBrush(QColor(TEMA["bg1"]))
+        p.drawEllipse(r)
+        for i in range(12):                                          # marcas de las horas
+            a = math.radians(i * 30)
+            c = r.center(); rr = r.width() / 2
+            l = 2.6 if i % 3 == 0 else 1.4
+            p.setPen(QPen(QColor(255, 255, 255, 150 if i % 3 == 0 else 70), 1.0))
+            p.drawLine(QPointF(c.x() + math.sin(a) * (rr - l), c.y() - math.cos(a) * (rr - l)),
+                       QPointF(c.x() + math.sin(a) * (rr - 0.6), c.y() - math.cos(a) * (rr - 0.6)))
+        p.setPen(QPen(self._color, 3.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawArc(r.adjusted(1.6, 1.6, -1.6, -1.6), 90 * 16, int(-self._k * 360 * 16))     # progreso, en sentido horario
+        a = self._k * 2 * math.pi; c = r.center()
+        p.setPen(QPen(QColor("#ffffff"), 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawLine(c, QPointF(c.x() + math.sin(a) * (r.width() / 2 - 4.5), c.y() - math.cos(a) * (r.width() / 2 - 4.5)))
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(self._color); p.drawEllipse(c, 1.6, 1.6)
+
+
 class EtiquetaTema(EtiquetaElidida):
     """Nombre del tema de un deck: al hacer clic avisa para ubicarlo en la lista de la biblioteca."""
     clicked = Signal()
@@ -1462,6 +1494,7 @@ class Deck(QFrame):
         self.volume = 1.0          # volumen de cada deck fijo al 100 %: el nivel se maneja con el crossfader y el volumen general
         self.auto_gain = 1.0
         self.tempo_rate = 1.0
+        self.tempo_manual = False   # el usuario fijó el tempo a mano: nada lo toca hasta que mezcle o apriete Reset
         self.trim = 1.0
         self.on_play_cb = None
         self.on_reset_cb = None
@@ -1521,7 +1554,7 @@ class Deck(QFrame):
         self.btn_play.clicked.connect(self.play)
         self.btn_pause.clicked.connect(self.pause)
         self.btn_stop.clicked.connect(self.stop)
-        self.btn_reset.clicked.connect(lambda *_: self.reset_tempo())
+        self.btn_reset.clicked.connect(lambda *_: self.reset_tempo(suave=True))
         self.btn_reset.setToolTip("Resetear el tempo al 100 % (el tema sigue donde está)")
         r3.addSpacing(6)
         r3.addWidget(QLabel("Tempo"))                    # el slider de tempo va en la misma fila, a la derecha del botón de reset
@@ -1529,6 +1562,14 @@ class Deck(QFrame):
         self.sld_tempo.setRange(50, 200); self.sld_tempo.setValue(100)
         self.sld_tempo.setMinimumWidth(120)
         r3.addWidget(self.sld_tempo, stretch=1)
+        self._flechas_tempo = []
+        self.reloj_reset = RelojReset(self, color)
+        for txt, paso, tip in (("◀", -1, "Tempo −1 %"), ("▶", 1, "Tempo +1 %")):
+            b = QPushButton(txt); self._flechas_tempo.append(b); b.setFixedSize(24, 24); b.setAutoRepeat(True); b.setAutoRepeatDelay(350); b.setAutoRepeatInterval(90)
+            b.setToolTip(tip + "  (el tempo se mantiene hasta que mezcle o toques Reset)")
+            b.setStyleSheet("QPushButton { padding:0px; font-size:11px; }")
+            b.clicked.connect(lambda _=False, d=paso: self.sld_tempo.setValue(self.sld_tempo.value() + d))
+            r3.addWidget(b)
         lay.addLayout(r3)
 
         self.sld_tempo.valueChanged.connect(self._update_tempo)
@@ -1697,11 +1738,50 @@ class Deck(QFrame):
             self.cursor = 0
             self._cursor_frac = 0.0
 
-    def reset_tempo(self):
-        """Solo vuelve el tempo al 100 % (y el microajuste a 1.0). NO toca la posición del tema."""
+    RESET_SUAVE_S = 3.0          # el botón Reset vuelve al 100 % progresivamente (si el tema está sonando)
+
+    def _ubicar_reloj(self):
+        """Lo deja centrado justo arriba de las dos flechitas."""
+        a, b = self._flechas_tempo
+        c = a.mapTo(self, QPoint(0, 0)); d = b.mapTo(self, QPoint(b.width(), 0))
+        self.reloj_reset.move((c.x() + d.x() - self.reloj_reset.width()) // 2, c.y() - self.reloj_reset.height() - 3)
+        self.reloj_reset.raise_()
+
+    def _paso_reset_suave(self):
+        k = min(1.0, (time.monotonic() - self._rs_t0) / self.RESET_SUAVE_S)
+        self.reloj_reset.set_progreso(k)
+        e = 0.5 - 0.5 * math.cos(k * math.pi)                      # arranca y termina despacio
+        self.tempo_rate = self._rs_r0 + (1.0 - self._rs_r0) * e
+        pct = int(round(self.tempo_rate * 100))
+        if self.sld_tempo.value() != pct:
+            self.sld_tempo.blockSignals(True); self.sld_tempo.setValue(pct); self.sld_tempo.blockSignals(False)
+        self._update_bpm_label()
+        if k >= 1.0:
+            self._rs_timer.stop(); self.tempo_rate = 1.0
+            self._update_bpm_label()
+            QTimer.singleShot(350, lambda: None if self._rs_timer.isActive() else self.reloj_reset.hide())   # un instante completo y se va
+
+    def _cancelar_reset_suave(self):
+        t = getattr(self, "_rs_timer", None)
+        if t is not None and t.isActive():
+            t.stop()
+        self.reloj_reset.hide()
+
+    def reset_tempo(self, suave=False):
+        """Solo vuelve el tempo al 100 % (y el microajuste a 1.0). NO toca la posición del tema.
+        Con suave=True y el tema sonando, la vuelta es progresiva (desimulada) en vez de un salto."""
         self.trim = 1.0
+        self.tempo_manual = False
+        self._cancelar_reset_suave()
+        if suave and self.playing and abs(self.tempo_rate - 1.0) > 0.004:
+            if getattr(self, "_rs_timer", None) is None:
+                self._rs_timer = QTimer(self); self._rs_timer.setInterval(30)
+                self._rs_timer.timeout.connect(self._paso_reset_suave)
+            self._rs_r0 = self.tempo_rate; self._rs_t0 = time.monotonic()
+            self.reloj_reset.set_progreso(0.0); self._ubicar_reloj(); self.reloj_reset.show()
+            self._rs_timer.start()
         # Resetea el tempo_rate al 100% (slider incluido, sin disparar señales)
-        if abs(self.tempo_rate - 1.0) > 1e-6:
+        elif abs(self.tempo_rate - 1.0) > 1e-6:
             self.tempo_rate = 1.0
             pct = 100
             if self.sld_tempo.value() != pct:
@@ -1719,7 +1799,9 @@ class Deck(QFrame):
     reset_time = reset_tempo      # nombre anterior, por compatibilidad
 
     def _update_tempo(self):
+        self._cancelar_reset_suave()
         self.tempo_rate = self.sld_tempo.value() / 100.0
+        self.tempo_manual = (self.sld_tempo.value() != 100)      # (los cambios por programa bloquean la señal: esto es del usuario)
         self._update_bpm_label()
 
     def set_tempo_from_fader(self, rate):
@@ -4808,6 +4890,8 @@ class AutoMix(QMainWindow):
                                       ("_target_rate_b", "_alpha_b", self.deck_b)):
             target = getattr(self, attr_t)
             if target is None: continue
+            if deck.tempo_manual:
+                setattr(self, attr_t, None); continue
             if self.magnet_on and deck is self.slave_for_magnet:      # lo maneja el sync, sin retraso
                 setattr(self, attr_t, None); continue
             alpha = getattr(self, attr_al)
@@ -4929,6 +5013,10 @@ class AutoMix(QMainWindow):
         master, slave = otro, deck
         if not (master.original_bpm and slave.original_bpm):
             return
+        if slave.tempo_manual:                       # tempo fijado a mano: se respeta (se suelta al mezclar o con Reset)
+            if self.magnet_on:
+                self._soltar_sync(None)
+            return
         slave.trim = 1.0
         self._err_filtrado = 0.0
         self._sync_I = 0.0; self._sync_t = None; self._sync_hist = []
@@ -5036,6 +5124,8 @@ class AutoMix(QMainWindow):
             return
         if self._cruce_simple():                       # BPM muy distintos: no hay nada que emparejar
             return
+        if (a.tempo_manual or b.tempo_manual) and not (self.mix_timer.isActive() or self.mix_pausa_timer.isActive()):
+            return                                     # tempo fijado a mano: se respeta hasta que mezcle o toque Reset
         t = time.monotonic()
         if t - getattr(self, "_t_vig_sync", 0.0) < 1.5:
             return
@@ -5072,6 +5162,8 @@ class AutoMix(QMainWindow):
         if quedo is None: return
         quedo.tempo_rate = float(np.clip(quedo.tempo_rate * quedo.trim, 0.5, 2.0))   # mismo rate_eff: sin escalón
         quedo.trim = 1.0
+        if quedo.tempo_manual:
+            return
         if quedo.playing and abs(quedo.tempo_rate - 1.0) > 1e-4:
             if quedo is self.deck_a:
                 self._target_rate_a, self._alpha_a = 1.0, 0.01
@@ -5111,6 +5203,7 @@ class AutoMix(QMainWindow):
                 return
         self._mix_espera_n = 0
         self._mix_esperando = False
+        entra.tempo_manual = False                   # al mezclar, el entrante vuelve a seguir al sync
         simple = self._cruce_simple()
         if simple:                           # BPM muy distintos: sin emparejar nada, solo se arranca el entrante
             if not entra.playing:
