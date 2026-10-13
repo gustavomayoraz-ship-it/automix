@@ -2594,11 +2594,12 @@ class GraficoCruce(QWidget):
     def __init__(self):
         super().__init__()
         self.punto_a = DEF_PUNTO_A; self.punto_b = DEF_PUNTO_B; self.avance = None
-        self.punto_s = DEF_PUNTO_S; self.bandas = False
+        self.punto_s = DEF_PUNTO_S; self.bandas = False; self.simple = False
         self.setMinimumHeight(62)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-    def actualizar(self, pa, pb, avance=None, ps=None, bandas=False, fa=1.0):
+    def actualizar(self, pa, pb, avance=None, ps=None, bandas=False, fa=1.0, simple=False):
+        self.simple = bool(simple)
         self.punto_a, self.punto_b, self.avance = pa, pb, avance
         self.fin_a = fa
         if ps is not None:
@@ -2620,7 +2621,9 @@ class GraficoCruce(QWidget):
         pa, pb, la, lb = [], [], [], []
         for i in range(61):
             t = i / 60
-            if self.bandas:
+            if self.simple:
+                vs, ve = math.cos(t * math.pi / 2.0), math.sin(t * math.pi / 2.0); ls, le = vs, ve
+            elif self.bandas:
                 vs, ve, ls, le = perfil_cruce_bandas(t, self.punto_a, self.punto_b, self.punto_s, fin_a=getattr(self, "fin_a", 1.0))
             else:
                 vs, ve = perfil_cruce_ab(t, self.punto_a, self.punto_b); ls, le = vs, ve
@@ -2637,13 +2640,16 @@ class GraficoCruce(QWidget):
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.setPen(QPen(QColor(c.red(), c.green(), c.blue(), 55), 8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)); p.drawPolyline(QPolygonF(pts))   # resplandor
             p.setPen(QPen(c, 2.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)); p.drawPolyline(QPolygonF(pts))
-        if self.bandas:                                  # graves: línea punteada, el traspaso se ve como un escalón
+        if self.bandas and not self.simple:              # graves: línea punteada, el traspaso se ve como un escalón
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.setPen(QPen(ca.lighter(150), 2, Qt.PenStyle.DotLine)); p.drawPolyline(QPolygonF(la))
             p.setPen(QPen(cb.lighter(150), 2, Qt.PenStyle.DotLine)); p.drawPolyline(QPolygonF(lb))
             xs = x0 + (x1 - x0) * max(0.0, min(1.0, self.punto_s))          # dónde se traspasa el bajo
             p.setPen(QPen(QColor(TEMA["verde"]), 1, Qt.PenStyle.DashLine)); p.drawLine(QPointF(xs, yt), QPointF(xs, yb))
         curva(pa, ca); curva(pb, cb)
+        if self.simple:
+            fs = QFont(self.font()); fs.setPointSizeF(max(7.0, 7.5 * UI_ESCALA * FUENTE_BOOST)); fs.setBold(True); p.setFont(fs)
+            p.setPen(QColor(TEMA["ambar"])); p.drawText(QRectF(x0, yt - 2, x1 - x0, 16), int(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter), "CRUCE SIMPLE · BPM distintos")
         if self.avance is not None:
             xa = x0 + (x1 - x0) * max(0.0, min(1.0, self.avance))
             p.setPen(QPen(QColor(255, 255, 255, 60), 6)); p.drawLine(QPointF(xa, yt), QPointF(xa, yb))
@@ -2726,7 +2732,9 @@ class PanelCruce(QFrame):
         x = self.v.crossfader.value() / 100.0
         t = x if self.v._cf_dir == "AB" else 1.0 - x
         pl = self.v._plan_activo() if hasattr(self.v, "mix_timer") else None
-        if pl:                                           # durante una mezcla con receta, el gráfico muestra la receta
+        if self.v._cruce_simple():
+            self.graf.actualizar(0.0, 0.0, t, None, False, 1.0, True)
+        elif pl:                                           # durante una mezcla con receta, el gráfico muestra la receta
             self.graf.actualizar(pl["pa"], pl["pb"], t, pl["ps"], True, pl["fa"])
         else:
             self.graf.actualizar(self.sl_a.value() / 100.0, self.sl_b.value() / 100.0, t,
@@ -4330,7 +4338,7 @@ class AutoMix(QMainWindow):
                 return
             self._aviso_armonico = None
         espera = None
-        if self.chk_frases.isChecked() and not exacto and sale.playing and sale.analysis and entra.analysis and entra.audio is not None:
+        if self.chk_frases.isChecked() and not exacto and not self._cruce_simple() and sale.playing and sale.analysis and entra.analysis and entra.audio is not None:
             espera = self._hasta_proxima_frase(sale)
             if espera is not None:
                 dur = self._duracion_mezcla_para(sale, entra, True)
@@ -4734,8 +4742,14 @@ class AutoMix(QMainWindow):
         if fader_val == 0: self._cf_dir = "AB"
         elif fader_val == 100: self._cf_dir = "BA"
 
-        bandas = bool(self.cruce_ab and self.cruce_bandas)
-        if bandas:
+        simple = self._cruce_simple()
+        bandas = bool(self.cruce_ab and self.cruce_bandas and not simple)
+        if simple:                                       # BPM muy distintos: cruce simple de potencia constante
+            gan_a = math.cos(x * math.pi / 2.0)
+            gan_b = math.sin(x * math.pi / 2.0)
+            hi_a = lo_a = gan_a
+            hi_b = lo_b = gan_b
+        elif bandas:
             t = x if self._cf_dir == "AB" else 1.0 - x
             pl = self._plan_activo()
             if pl:
@@ -4795,6 +4809,11 @@ class AutoMix(QMainWindow):
             return True
         return max(a, b) / min(a, b) <= self.BPM_RATIO_MAX
 
+    def _cruce_simple(self):
+        """True si los dos temas tienen BPM muy distintos: no se empareja nada (ni tempo, ni compases, ni fase)
+        y la mezcla es un cruce simple de volumen, sin bandas ni recetas."""
+        return not self._bpm_compatibles()
+
     def _apply_shared_bpm(self, x):
         bpm_a0 = self.deck_a.original_bpm
         bpm_b0 = self.deck_b.original_bpm
@@ -4829,9 +4848,13 @@ class AutoMix(QMainWindow):
             self._target_rate_a = self._target_rate_b = None
             if self.magnet_on:
                 self._soltar_sync(None)
-            SmartSync.align_downbeats(master, slave)
-            self._set_status(f"↔ BPM muy distintos ({master.original_bpm:.0f} y {slave.original_bpm:.0f}): "
-                             f"cada tema mantiene su velocidad (sin estirar)")
+            # BPM muy distintos: NO se alinean compases (eso hacía saltar al entrante hacia atrás y adelante)
+            msg = (f"↔ BPM muy distintos ({master.original_bpm:.0f} y {slave.original_bpm:.0f}): "
+                   f"cruce simple, cada tema mantiene su velocidad")
+            if getattr(self, "_aviso_simple", None) != msg:
+                self._aviso_simple = msg
+                print("[mezcla]", msg)
+            self._set_status(msg)
             return
         bpm_maestro = master.original_bpm * master.rate_eff
         rate_slave = float(np.clip(bpm_maestro / slave.original_bpm, 0.5, 2.0))
@@ -4922,6 +4945,8 @@ class AutoMix(QMainWindow):
         a, b = self.deck_a, self.deck_b
         if self.magnet_on or not (a.playing and b.playing and a.analysis and b.analysis):
             return
+        if self._cruce_simple():                       # BPM muy distintos: no hay nada que emparejar
+            return
         t = time.monotonic()
         if t - getattr(self, "_t_vig_sync", 0.0) < 1.5:
             return
@@ -4997,11 +5022,17 @@ class AutoMix(QMainWindow):
                 return
         self._mix_espera_n = 0
         self._mix_esperando = False
-        if not entra.playing:
-            entra.play()                     # al arrancar, _auto_sync ya lo alinea
+        simple = self._cruce_simple()
+        if simple:                           # BPM muy distintos: sin emparejar nada, solo se arranca el entrante
+            if not entra.playing:
+                entra.play()
+            print(f"[mezcla] BPM muy distintos ({self.deck_a.original_bpm:.0f} / {self.deck_b.original_bpm:.0f}): cruce simple")
         else:
-            self._auto_sync(entra)           # ya sonaba (en espera): al empezar la mezcla se alinea A LA FUERZA
-        self._alinear_ya(entra)              # y se confirma con el primer downbeat, antes de que se escuche
+            if not entra.playing:
+                entra.play()                     # al arrancar, _auto_sync ya lo alinea
+            else:
+                self._auto_sync(entra)           # ya sonaba (en espera): al empezar la mezcla se alinea A LA FUERZA
+            self._alinear_ya(entra)              # y se confirma con el primer downbeat, antes de que se escuche
 
         self._cf_dir = "AB" if target == 100 else "BA"
         self.mix_from = current
@@ -5018,11 +5049,11 @@ class AutoMix(QMainWindow):
         interval_ms = 50
         self.mix_steps_total = int(duration_s * (1000.0 / interval_ms))
         self.mix_steps_done = 0
-        self._mix_pausa_hecha = False
+        self._mix_pausa_hecha = bool(simple)     # cruce simple: sin la pausa de 3 s al 50 % (con dos tempos distintos suena mal)
         self.mix_pausa_timer.stop()
 
         self._plan = None
-        if self.recetas and self.cruce_ab and self.cruce_bandas:
+        if self.recetas and self.cruce_ab and self.cruce_bandas and not simple:
             try:
                 self._plan = self._planificar_mezcla(sale_d, entra, duration_s)
             except Exception:
