@@ -1,5 +1,5 @@
 """
-AutoMix — PySide6  (mezclador DJ de dos decks: cruce por bandas, mezcla armónica y por frases, recetas automáticas)
+AutoMix — PySide6  (mezclador DJ de dos decks: cruce por bandas, recetas automáticas)
 - Play individual por deck
 - Waveform de cada deck se mueve SOLO si suena
 - 🔗 Sync automático de BPM y downbeats sin tirones
@@ -1157,7 +1157,7 @@ def load_audio_stereo(path, sr=44100):
 # 0.5) TEMA VISUAL (oscuro, con acentos de neón)
 # =====================================================================
 TEMA = dict(
-    bg0="#06070c", bg1="#0b0e16", bg2="#121726", bg3="#1a2133", linea="#252d44",
+    fondo="#06070c", bg0="#06070c", bg1="#0b0e16", bg2="#121726", bg3="#1a2133", linea="#252d44",
     texto="#e9eeff", suave="#8892b0", cian="#22d3ff", magenta="#ff3d9a", verde="#2cff9a",
     ambar="#ffb82e", rojo="#ff3b4e", violeta="#8b5cf6",
 )
@@ -1179,7 +1179,7 @@ def aplicar_tema(app):
     except Exception:
         pass
     pal = QPalette()
-    pal.setColor(QPalette.ColorRole.Window, QColor(T["bg0"]))
+    pal.setColor(QPalette.ColorRole.Window, QColor(T["fondo"]))
     pal.setColor(QPalette.ColorRole.WindowText, QColor(T["texto"]))
     pal.setColor(QPalette.ColorRole.Base, QColor(T["bg1"]))
     pal.setColor(QPalette.ColorRole.AlternateBase, QColor("#0e1322"))
@@ -1214,13 +1214,13 @@ def aplicar_tema(app):
         f = app.font(); f.setFamily("Segoe UI"); app.setFont(f)
     app.setStyleSheet(f"""
 QToolTip {{ background:{T['bg2']}; color:{T['texto']}; border:1px solid {T['cian']}; padding:5px; border-radius:4px; }}
-QSplitter::handle {{ background:{T['bg0']}; }}
+QSplitter::handle {{ background:{T['fondo']}; }}
 QSplitter::handle:hover {{ background:{T['cian']}; }}
 
-QGroupBox {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #141b2d, stop:1 #0d1220);
+QGroupBox {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #1b243b, stop:1 #131a2c);
             border:1px solid {T['linea']}; border-radius:12px; margin-top:12px; padding-top:6px; }}
 QGroupBox::title {{ subcontrol-origin:margin; subcontrol-position:top left; left:14px; padding:0 8px; color:{T['cian']}; font-weight:bold; }}
-QFrame#panelcruce {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #141b2d, stop:1 #0d1220);
+QFrame#panelcruce {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #1b243b, stop:1 #131a2c);
             border:1px solid {T['linea']}; border-radius:12px; }}
 
 QPushButton {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #2a3452, stop:1 #171d31);
@@ -1413,6 +1413,17 @@ class VuMeter(QWidget):
         p.setPen(QColor(TEMA["rojo"]) if on_l else QColor("#4a5473"))
         p.drawText(QRectF(xt, 2 + mitad, ancho_txt, mitad), int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), f"LIM    {-lim:+.1f}" if on_l else "LIM     0.0")
         p.end()
+
+
+class _OpcionApagada:
+    """Reemplaza a una casilla que ya no existe en pantalla: siempre desactivada."""
+    @staticmethod
+    def isChecked():
+        return False
+
+    @staticmethod
+    def setChecked(_v):
+        pass
 
 
 class EtiquetaAncha(QLabel):
@@ -3934,17 +3945,10 @@ class AutoMix(QMainWindow):
         lib_btns.addWidget(b_limpiar); lib_btns.addWidget(self.btn_ordenar)
         lib_btns.addWidget(self.btn_reanalizar)
         lib_lay.addLayout(lib_btns)
-        cfg_mi = leer_config()
-        self.chk_armonico = QCheckBox("🎼 Armónico")
-        self.chk_armonico.setToolTip("El siguiente tema se elige entre los que suenan bien con el actual (rueda de Camelot + BPM parecido),\nsin repetir los ya tocados. En la lista, los compatibles se pintan de verde.\nSi la clave de los dos choca, la mezcla se acorta para que no se note.")
-        self.chk_armonico.setChecked(bool(cfg_mi.get("armonico", True)))
-        self.chk_armonico.toggled.connect(lambda v: (guardar_config(armonico=bool(v)), self._reordenar_pronto(50)))
-        self.chk_frases = QCheckBox("🥁 En frase")
-        self.chk_frases.setToolTip("La mezcla automática arranca justo cuando el tema que suena empieza una frase (cada 8 compases),\ncon el tema entrante saliendo desde su primer compás, y dura un número exacto de compases.")
-        self.chk_frases.setChecked(bool(cfg_mi.get("frases", True)))
-        self.chk_frases.toggled.connect(lambda v: (guardar_config(frases=bool(v)), self._reordenar_pronto(50)))
-        fila_chk = QVBoxLayout(); fila_chk.setSpacing(0); fila_chk.addWidget(self.chk_armonico); fila_chk.addWidget(self.chk_frases)
-        lib_lay.addLayout(fila_chk)
+        # 🎼 Armónico y 🥁 En frase se quitaron de la pantalla: quedan siempre apagados
+        # (el siguiente tema es el que sigue en la lista, ordenada por BPM, y la mezcla automática arranca al llegar a la marca).
+        self.chk_armonico = _OpcionApagada()
+        self.chk_frases = _OpcionApagada()
         lib_lay.addWidget(EtiquetaElidida("Arrastrá un tema a Deck A o B"))
         self.ed_filtro.textChanged.connect(self._filtrar_biblioteca)
         self.biblioteca.cambio.connect(self._biblioteca_cambio)
@@ -4871,19 +4875,26 @@ class AutoMix(QMainWindow):
         self._ajustar_a_pantalla()
 
     def _a_la_esquina(self):
-        """Botón ↖: la ventana vuelve al tamaño mínimo de arranque y queda pegada a la esquina superior izquierda."""
+        """Botón ↖: la ventana vuelve al tamaño mínimo de arranque y queda pegada a la esquina superior izquierda.
+        Se repite en varias pasadas hasta que el tamaño y la escala quedan firmes (Windows aplica el cambio de
+        tamaño y el re-escalado de las letras con retraso: con una sola pasada había que apretar dos veces)."""
         log("ventana", "botón ↖: tamaño mínimo en la esquina superior izquierda")
-        def _poner():
-            self._aplicar_escala(ESC_MIN)
-            self.resize(self.minimumSizeHint())
-            self._escalar_segun_ventana()
-            self._ajustar_a_pantalla(esquina=True)
+        self._gen_esquina = getattr(self, "_gen_esquina", 0) + 1
+        gen = self._gen_esquina
         if self.isMaximized() or self.isFullScreen():
             self.showNormal()                          # el cambio de estado lo procesa Qt; después se acomoda
-            QTimer.singleShot(150, _poner)
-        else:
-            _poner()
-            QTimer.singleShot(150, _poner)             # 2.ª pasada: con la escala ya aplicada el mínimo real queda exacto
+        def _pasada():
+            if gen != self._gen_esquina:               # se apretó otra vez: manda la pasada nueva
+                return
+            self._aplicar_escala(ESC_MIN)
+            QApplication.processEvents()
+            self.layout().activate() if self.layout() is not None else None
+            self.resize(self.minimumSizeHint())
+            QApplication.processEvents()
+            self._escalar_segun_ventana()
+            self._ajustar_a_pantalla(esquina=True)
+        for ms in (0, 120, 300, 600, 1000):
+            QTimer.singleShot(ms, _pasada)
 
     def _ajustar_a_pantalla(self, esquina=False):
         """Al iniciar: que la ventana entre en la pantalla (barra de tareas incluida), centrada, con el
