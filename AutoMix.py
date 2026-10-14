@@ -1415,6 +1415,24 @@ class VuMeter(QWidget):
         p.end()
 
 
+class EtiquetaAncha(QLabel):
+    """Etiqueta de valor numérico con ancho CONSTANTE: mide el más ancho de los textos posibles, así al cambiar
+    el valor ("-9.0 dB" ↔ "-12.5 dB") la grilla no se corre ni los deslizadores vecinos se redimensionan."""
+    def __init__(self, textos, texto=""):
+        super().__init__(texto)
+        self._textos = list(dict.fromkeys(textos)) or [texto]
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+
+    def sizeHint(self):
+        fm = self.fontMetrics()
+        w = max(fm.horizontalAdvance(t) for t in self._textos + [self.text()])
+        h = super().sizeHint().height()
+        return QSize(w + 2 * self.margin() + 4, h)
+
+    def minimumSizeHint(self):
+        return self.sizeHint()
+
+
 class EtiquetaElidida(QLabel):
     def __init__(self, texto=""):
         super().__init__()
@@ -1521,6 +1539,7 @@ class Deck(QFrame):
         self.volume = 1.0          # volumen de cada deck fijo al 100 %: el nivel se maneja con el crossfader y el volumen general
         self.auto_gain = 1.0
         self.tempo_rate = 1.0
+        self.pos_manual = False     # el usuario ubicó el tema con la manito: la mezcla automática lo respeta
         self.tempo_manual = False   # el usuario fijó el tempo a mano: nada lo toca hasta que mezcle o apriete Reset
         self.trim = 1.0
         self.on_play_cb = None
@@ -1587,7 +1606,7 @@ class Deck(QFrame):
         r3.addWidget(QLabel("Tempo"))                    # el slider de tempo va en la misma fila, a la derecha del botón de reset
         self.sld_tempo = QSlider(Qt.Orientation.Horizontal)
         self.sld_tempo.setRange(50, 200); self.sld_tempo.setValue(100)
-        self.sld_tempo.setMinimumWidth(120)
+        self.sld_tempo.setMinimumWidth(70)
         r3.addWidget(self.sld_tempo, stretch=1)
         self._flechas_tempo = []
         self.reloj_reset = RelojReset(self, color)
@@ -1643,8 +1662,35 @@ class Deck(QFrame):
         if f:
             self.load_track(f)
 
+    def descargar(self):
+        """Deck vacío: como recién abierto el programa (sin tema, sin análisis, tempo al 100 %)."""
+        self._cancelar_reset_suave()
+        self.stop()
+        with self.lock:
+            self.audio = None
+            self.cursor = 0
+            self._cursor_frac = 0.0
+        self.analysis = None
+        self.original_bpm = None
+        self.path = None
+        self.auto_gain = 1.0
+        self._ag_listo = False
+        self._db_cache = None
+        self.tempo_rate = 1.0
+        self.tempo_manual = False
+        self.pos_manual = False
+        self.trim = 1.0
+        if self.sld_tempo.value() != 100:
+            self.sld_tempo.blockSignals(True); self.sld_tempo.setValue(100); self.sld_tempo.blockSignals(False)
+        self._marcar_cargado(False)
+        self.lbl_track.setText("Arrastrá una canción aquí"); self.lbl_track.setToolTip("")
+        self.lbl_bpm.setText("BPM: --")
+        self.lbl_time.setText("00:00 / 00:00")
+        log(f"deck {self.name}", "vaciado")
+
     def load_track(self, path):
         self.stop()
+        self.pos_manual = False
         with self.lock:
             self.audio = None
             self.cursor = 0
@@ -1800,7 +1846,51 @@ class Deck(QFrame):
         t = getattr(self, "_rs_timer", None)
         if t is not None and t.isActive():
             t.stop()
+        t = getattr(self, "_aj_timer", None)
+        if t is not None and t.isActive():
+            t.stop()
+        self._aj_gen = getattr(self, "_aj_gen", 0) + 1
         self.reloj_reset.hide()
+
+    # ---- reloj del AJUSTE AUTOMÁTICO de velocidad (sync / auto-enganche): el mismo relojito del Reset ----
+    def _reset_activo(self):
+        t = getattr(self, "_rs_timer", None)
+        return t is not None and t.isActive()
+
+    def mostrar_ajuste(self, k):
+        """Muestra el reloj con el progreso k (0..1) del ajuste de velocidad que hace el programa solo."""
+        if self._reset_activo():
+            return
+        self._aj_gen = getattr(self, "_aj_gen", 0) + 1            # cancela cualquier ocultamiento pendiente
+        self.reloj_reset.set_progreso(k)
+        if not self.reloj_reset.isVisible():
+            self._ubicar_reloj(); self.reloj_reset.show()
+
+    def ocultar_ajuste(self, demora=350):
+        self._aj_gen = getattr(self, "_aj_gen", 0) + 1
+        g = self._aj_gen
+        def _h():
+            if g == getattr(self, "_aj_gen", 0) and not self._reset_activo():
+                self.reloj_reset.hide()
+        QTimer.singleShot(demora, _h)
+
+    def barrido_ajuste(self, dur=1.3):
+        """El enganche cambió la velocidad de golpe: el reloj da una vuelta para que se note."""
+        if self._reset_activo():
+            return
+        if getattr(self, "_aj_timer", None) is None:
+            self._aj_timer = QTimer(self); self._aj_timer.setInterval(30)
+            self._aj_timer.timeout.connect(self._paso_barrido)
+        self._aj_t0 = time.monotonic(); self._aj_dur = float(dur)
+        self.mostrar_ajuste(0.0)
+        self._aj_timer.start()
+
+    def _paso_barrido(self):
+        k = min(1.0, (time.monotonic() - self._aj_t0) / max(0.05, self._aj_dur))
+        self.mostrar_ajuste(0.5 - 0.5 * math.cos(k * math.pi))
+        if k >= 1.0:
+            self._aj_timer.stop()
+            self.ocultar_ajuste()
 
     def reset_tempo(self, suave=False):
         """Solo vuelve el tempo al 100 % (y el microajuste a 1.0). NO toca la posición del tema.
@@ -3973,6 +4063,13 @@ class AutoMix(QMainWindow):
         if not CONSOLA.es_windows:
             self.btn_consola.setVisible(False)
         self._f_dur.insertWidget(self._f_dur.count() - 1, self.btn_consola)   # al costado de Duración, mismo tamaño
+        self.btn_esquina = QPushButton("↖")
+        self.btn_esquina.setFixedSize(76, 52)
+        self.btn_esquina.setStyleSheet("QPushButton { font-size:34px; padding:0px; }")
+        self.btn_esquina.setToolTip("Ventana al tamaño mínimo, en la esquina superior izquierda de la pantalla")
+        self.btn_esquina.clicked.connect(self._a_la_esquina)
+        self._f_dur.insertSpacing(self._f_dur.count() - 1, 6)
+        self._f_dur.insertWidget(self._f_dur.count() - 1, self.btn_esquina)   # al lado de la consola
 
         barra_box = QGroupBox("⚓ Auto-enganche — progreso del tema sonando")
         barra_box.setFixedHeight(84)
@@ -4048,6 +4145,7 @@ class AutoMix(QMainWindow):
 
         self.biblioteca.cargar()
         self._update_cf()
+        QTimer.singleShot(0, self._restaurar_decks)
 
         self._esc_actual = 1.0
         self._ratio_lista = 470.0 / 1560.0
@@ -4095,8 +4193,7 @@ class AutoMix(QMainWindow):
         self.sld_mb = QSlider(Qt.Orientation.Horizontal)
         self.sld_mb.setRange(0, 100)
         self.sld_mb.setValue(int(cfg.get("mb_int", 60)))
-        self.lbl_mb = QLabel(f"{self.sld_mb.value()} %")
-        self.lbl_mb.setMinimumWidth(44)
+        self.lbl_mb = EtiquetaAncha([f"{v} %" for v in range(0, 101)], f"{self.sld_mb.value()} %")
         self.lbl_mb.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         fila.addWidget(self.sld_mb, 1); fila.addWidget(self.lbl_mb); fila.addStretch(1)
         col = QVBoxLayout(); col.setSpacing(2); col.addLayout(fila)
@@ -4114,6 +4211,7 @@ class AutoMix(QMainWindow):
         for j, (nombre, _mn, _mx, _f, tip) in enumerate(columnas):
             e = EtiquetaElidida(nombre); e.setStyleSheet(suave); e.setToolTip(tip)
             g.addWidget(e, 1, 1 + 2 * j, 1, 2)
+        rango_man = (0, 0, 80, 120, 120)        # en manual el Ratio llega a 8:1 y la Compensación a +12 dB: el ancho cubre el máximo
         self.mb_medidores = []
         for i, banda in enumerate(("Graves", "Medios", "Agudos")):
             col_banda = {"Graves": TEMA["magenta"], "Medios": TEMA["ambar"], "Agudos": TEMA["cian"]}[banda]
@@ -4126,7 +4224,7 @@ class AutoMix(QMainWindow):
                 sl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
                 sl.setFocusPolicy(Qt.FocusPolicy.NoFocus); sl.setToolTip(tip)
                 sl.setStyleSheet(f"QSlider::sub-page:horizontal {{ background: {col_banda}; border-radius:4px; }} QSlider::handle:horizontal {{ border-color: {col_banda}; }}")
-                lbl = QLabel(fmt(sl.value())); lbl.setStyleSheet(suave); lbl.setMinimumWidth(48)
+                lbl = EtiquetaAncha([fmt(v) for v in range(mn, max(mx, rango_man[j]) + 1)], fmt(sl.value())); lbl.setStyleSheet(suave)
                 sl.valueChanged.connect(lambda v, l=lbl, f=fmt: l.setText(f(v)))
                 g.addWidget(sl, 2 + i, 1 + 2 * j); g.addWidget(lbl, 2 + i, 2 + 2 * j)
                 fila_m.append(sl)
@@ -4139,7 +4237,7 @@ class AutoMix(QMainWindow):
         def deslizador(fila_g, texto, mn, mx, valor, fmt, tip):
             et = QLabel(texto); et.setToolTip(tip)
             sl = QSlider(Qt.Orientation.Horizontal); sl.setRange(mn, mx); sl.setValue(int(valor)); sl.setToolTip(tip)
-            lb = QLabel(fmt(sl.value())); lb.setMinimumWidth(62)
+            lb = EtiquetaAncha([fmt(v) for v in range(mn, mx + 1)], fmt(sl.value()))
             lb.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             sl.valueChanged.connect(lambda v, l=lb, f=fmt: l.setText(f(v)))
             lb.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -4546,7 +4644,7 @@ class AutoMix(QMainWindow):
                 if espera + dur + 4.0 > resta:        # esperar a la frase no deja tiempo: se mezcla ya
                     espera = None
         if espera is None or espera < 0.05:
-            if not entra.playing and entra.audio is not None and entra.analysis:
+            if not entra.playing and entra.audio is not None and entra.analysis and not entra.pos_manual:
                 db_e = self._db_de(entra)
                 if len(db_e):
                     entra.set_position_seconds(float(db_e[0]))      # el entrante sale desde su primer compás
@@ -4560,7 +4658,7 @@ class AutoMix(QMainWindow):
             self._frase_armada = False
             if (self.deck_a.path, self.deck_b.path) != (pa, pb) or self.mix_timer.isActive() or self.mix_pausa_timer.isActive():
                 return                                  # cambió algo mientras esperaba (mezcla manual, otro tema…)
-            if not entra.playing and entra.audio is not None and entra.analysis:
+            if not entra.playing and entra.audio is not None and entra.analysis and not entra.pos_manual:
                 db_e = self._db_de(entra)
                 if len(db_e):
                     entra.set_position_seconds(float(db_e[0]))      # el entrante sale desde su primer compás
@@ -4772,9 +4870,24 @@ class AutoMix(QMainWindow):
         self._escalar_segun_ventana()
         self._ajustar_a_pantalla()
 
-    def _ajustar_a_pantalla(self):
+    def _a_la_esquina(self):
+        """Botón ↖: la ventana vuelve al tamaño mínimo de arranque y queda pegada a la esquina superior izquierda."""
+        log("ventana", "botón ↖: tamaño mínimo en la esquina superior izquierda")
+        def _poner():
+            self._aplicar_escala(ESC_MIN)
+            self.resize(self.minimumSizeHint())
+            self._escalar_segun_ventana()
+            self._ajustar_a_pantalla(esquina=True)
+        if self.isMaximized() or self.isFullScreen():
+            self.showNormal()                          # el cambio de estado lo procesa Qt; después se acomoda
+            QTimer.singleShot(150, _poner)
+        else:
+            _poner()
+            QTimer.singleShot(150, _poner)             # 2.ª pasada: con la escala ya aplicada el mínimo real queda exacto
+
+    def _ajustar_a_pantalla(self, esquina=False):
         """Al iniciar: que la ventana entre en la pantalla (barra de tareas incluida), centrada, con el
-        contenido re-escalado y el timeline redibujado con su tamaño final."""
+        contenido re-escalado y el timeline redibujado con su tamaño final. Con esquina=True queda arriba a la izquierda."""
         try:
             scr = self.screen() or QApplication.primaryScreen()
             ag = scr.availableGeometry()
@@ -4783,8 +4896,11 @@ class AutoMix(QMainWindow):
             w = min(self.width(), ag.width() - marco_w)       # nunca más grande que la pantalla
             h = min(self.height(), ag.height() - marco_h)
             self.resize(w, h)
-            self.move(ag.left() + (ag.width() - (w + marco_w)) // 2,
-                      ag.top() + (ag.height() - (h + marco_h)) // 2)
+            if esquina:
+                self.move(ag.left(), ag.top())
+            else:
+                self.move(ag.left() + (ag.width() - (w + marco_w)) // 2,
+                          ag.top() + (ag.height() - (h + marco_h)) // 2)
         except Exception:
             pass
         self._escalar_segun_ventana()
@@ -4857,6 +4973,44 @@ class AutoMix(QMainWindow):
     def _biblioteca_cambio(self):
         self.lbl_lib.setText(f"📁 Biblioteca ({self.biblioteca.count()})")
         self.biblioteca.guardar()
+        if self.biblioteca.count() == 0:
+            self._vaciar_decks()
+
+    def _vaciar_decks(self):
+        """La lista quedó vacía: los dos reproductores y la línea de tiempo (el espectro de abajo) se limpian."""
+        a, b = self.deck_a, self.deck_b
+        if a.audio is None and b.audio is None and not a.path and not b.path:
+            return
+        log("programa", "lista vacía: se descargan los dos decks")
+        self.mix_timer.stop(); self.mix_pausa_timer.stop()
+        self._plan = None
+        self._frase_armada = False
+        self._mix_esperando = False
+        self._mix_auto = False
+        self._target_rate_a = self._target_rate_b = None
+        try:
+            self._soltar_sync(None)
+        except Exception:
+            pass
+        self.magnet_on = False
+        a.descargar(); b.descargar()
+        try:
+            self.timeline.redraw()
+        except Exception:
+            import traceback; traceback.print_exc()
+        self.biblioteca.pintar(None, None)
+        self._set_status("🗑️ Lista vacía: reproductores descargados")
+
+    def _restaurar_decks(self):
+        """Al abrir: vuelven a quedar cargados los temas que tenían los decks al cerrar (si siguen existiendo y la lista no está vacía)."""
+        if self.biblioteca.count() == 0:
+            return
+        cfg = leer_config().get("decks_cargados") or {}
+        for d in (self.deck_a, self.deck_b):
+            p = cfg.get(d.name)
+            if p and os.path.isfile(p) and p.lower().endswith(SUPPORTED) and not d.path:
+                log("programa", f"se recupera el Deck {d.name}: {os.path.basename(p)}")
+                d.load_track(p)
 
     def _ubicar_en_lista(self, path):
         """Clic en el nombre del tema de un deck: lo busca en la biblioteca, lo selecciona y lo deja a la vista."""
@@ -4952,25 +5106,43 @@ class AutoMix(QMainWindow):
         self.lbl_zoom.setText(str(v))
         self.timeline.set_zoom_px(float(v))
 
+    def _fin_ajuste(self, deck, completo):
+        ep = self.__dict__.setdefault("_aj_ep", {})
+        if ep.pop(id(deck), None) is not None:
+            if completo:
+                deck.mostrar_ajuste(1.0)
+            deck.ocultar_ajuste()
+
     def _smooth_tempo(self):
+        ep = self.__dict__.setdefault("_aj_ep", {})
         for attr_t, attr_al, deck in (("_target_rate_a", "_alpha_a", self.deck_a),
                                       ("_target_rate_b", "_alpha_b", self.deck_b)):
             target = getattr(self, attr_t)
-            if target is None: continue
+            if target is None:
+                self._fin_ajuste(deck, False) if id(deck) in ep else None
+                continue
             if deck.tempo_manual:
-                setattr(self, attr_t, None); continue
+                setattr(self, attr_t, None); self._fin_ajuste(deck, False); continue
             if self.magnet_on and deck is self.slave_for_magnet:      # lo maneja el sync, sin retraso
-                setattr(self, attr_t, None); continue
+                setattr(self, attr_t, None); self._fin_ajuste(deck, False); continue
             alpha = getattr(self, attr_al)
             cur = deck.tempo_rate
             new = cur + (target - cur) * alpha
-            if abs(target - new) < 1e-5:
+            llego = abs(target - new) < 1e-5
+            if llego:
                 new = target
                 setattr(self, attr_t, None)
                 setattr(self, attr_al, 0.05)
             if new != cur:
                 deck.tempo_rate = new
                 deck._update_bpm_label()
+                if deck.playing:                              # el reloj marca cuánto falta para llegar a la velocidad del enganche
+                    r0 = ep.setdefault(id(deck), cur)
+                    dist0 = abs(target - r0)
+                    if dist0 >= 0.004:
+                        deck.mostrar_ajuste(1.0 - min(1.0, abs(target - new) / dist0))
+            if llego:
+                self._fin_ajuste(deck, True)
 
     def _update_cf(self):
         fader_val = self.crossfader.value()
@@ -5104,8 +5276,11 @@ class AutoMix(QMainWindow):
             return
         bpm_maestro = master.original_bpm * master.rate_eff
         rate_slave = float(np.clip(bpm_maestro / slave.original_bpm, 0.5, 2.0))
+        r_ini = slave.tempo_rate
         slave.set_tempo_from_fader(rate_slave)
         self._target_rate_a = self._target_rate_b = None
+        if abs(rate_slave - r_ini) >= 0.004:
+            slave.barrido_ajuste()                   # el entrante ajustó su velocidad al que suena: lo marca el relojito
 
         ok, msg = SmartSync.preparar_entrada(master, slave)
         self.timeline.redraw()
@@ -5272,6 +5447,7 @@ class AutoMix(QMainWindow):
                 return
         self._mix_espera_n = 0
         self._mix_esperando = False
+        entra.pos_manual = False
         entra.tempo_manual = False                   # al mezclar, el entrante vuelve a seguir al sync
         simple = self._cruce_simple()
         if simple:                           # BPM muy distintos: sin emparejar nada, solo se arranca el entrante
@@ -5447,6 +5623,8 @@ class AutoMix(QMainWindow):
 
     def _on_manito_release(self, deck):
         anchor = self.timeline.anchor_a if deck == "A" else self.timeline.anchor_b
+        d = self.deck_a if deck == "A" else self.deck_b
+        d.pos_manual = True                          # lo ubicó el usuario: si es el que entra, la mezcla arranca desde ahí
         self._set_status(f"✋ Deck {deck} movido a {fmt_time(anchor)}")
 
     def _tick(self):
@@ -5513,6 +5691,10 @@ class AutoMix(QMainWindow):
 
     def closeEvent(self, event):
         log("programa", "cerrando AutoMix")
+        try:
+            guardar_config(decks_cargados={"A": self.deck_a.path, "B": self.deck_b.path})     # al abrir vuelven a quedar cargados
+        except Exception:
+            pass
         try: CONSOLA.ocultar()
         except Exception: pass
         _cerrar_pool()
