@@ -25,10 +25,13 @@ import threading
 from pathlib import Path
 
 # =====================================================================
-# 1) DEPENDENCIAS DESDE ./dependencias_offline
+# 1) DEPENDENCIAS DESDE ./dependencias_offline/<versión de Python>
 # =====================================================================
 ROOT = Path(__file__).parent.resolve()
-OFFLINE = ROOT / "dependencias_offline"
+VERSION_PY = f"{sys.version_info.major}.{sys.version_info.minor}"          # 3.12, 3.15…
+# Las librerías compiladas sirven para UNA versión de Python: cada una tiene su carpeta (dependencias_offline/3.15, /3.14…)
+# y el programa usa la de la versión con la que se abrió. Así se pueden tener varios Python instalados sin que se pisen.
+OFFLINE = ROOT / "dependencias_offline" / VERSION_PY
 CACHE_DIR = ROOT / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
 
@@ -115,7 +118,7 @@ def asegurar_dependencias():
             cont.pack(fill="both", expand=True)
             tk.Label(cont, text="📦 Verificando dependencias", font=("Segoe UI", 14, "bold"),
                      bg="#f8f9fa", fg="#2c3e50").pack(anchor="w")
-            tk.Label(cont, text="Se guardan en la carpeta dependencias_offline", font=("Segoe UI", 9),
+            tk.Label(cont, text="Se guardan en dependencias_offline\\" + VERSION_PY, font=("Segoe UI", 9),
                      bg="#f8f9fa", fg="#7f8c8d").pack(anchor="w", pady=(0, 12))
             for _mod, nombre in DEPENDENCIAS:
                 fila = tk.Frame(cont, bg="#f8f9fa")
