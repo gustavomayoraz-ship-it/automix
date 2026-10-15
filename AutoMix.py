@@ -1235,7 +1235,7 @@ QPushButton[rol="pausa"] {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1, sto
 QPushButton[rol="stop"] {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #432030, stop:1 #26111b); border:1px solid #a8344f; color:#ff7a93; }}
 QPushButton[rol="play"]:pressed, QPushButton[rol="pausa"]:pressed, QPushButton[rol="stop"]:pressed {{ background:#0b0f1c; }}
 
-QSlider::groove:horizontal {{ height:6px; background:#080b14; border:1px solid {T['linea']}; border-radius:4px; }}
+QSlider::groove:horizontal {{ height:6px; background:#123a30; border:1px solid #1f5a48; border-radius:4px; }}
 QSlider::sub-page:horizontal {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #0f7fa6, stop:1 {T['cian']}); border-radius:4px; }}
 QSlider::add-page:horizontal {{ background:transparent; }}
 QSlider::handle:horizontal {{ width:14px; height:14px; margin:-6px 0; border-radius:8px; border:2px solid {T['cian']};
@@ -1533,6 +1533,95 @@ class EtiquetaTema(EtiquetaElidida):
         super().mousePressEvent(e)
 
 
+class WsolaFlujo:
+    """Time-stretch en tiempo real por WSOLA (Waveform Similarity Overlap-Add): cambia la velocidad SIN cambiar el tono.
+    Cada trama (N muestras, ventana de Hann, solape del 50 %) se toma del tema cerca de su posición nominal
+    (que avanza HS*rate por trama) eligiendo, dentro de una ventana de búsqueda, el punto donde la onda más se parece
+    a la continuación natural de la trama anterior: así las ondas empalman en fase (sin el sonido "de robot" del
+    vocoder) y los golpes (bombo, caja) no se manchan.
+    La ventana de búsqueda es asimétrica: se deja poco margen hacia el lado en que se acumularía el corrimiento de
+    tiempo (según el tema vaya más rápido o más lento) y mucho hacia el otro, para que el audio quede siempre a
+    pocos milisegundos de donde marca el cursor y el emparejado de los dos decks no se desfase."""
+    N = 1536                 # largo de cada trama (35 ms a 44,1 kHz)
+    HS = 768                 # avance de salida entre tramas (50 % de solape)
+    DS = 48                  # margen corto de búsqueda (muestras): lado donde se acumularía el corrimiento
+    DB = 160                 # margen largo de búsqueda (muestras): lado por el que se puede "volver"
+
+    def __init__(self):
+        self.W = (np.sin(np.pi * (np.arange(self.N) + 0.5) / self.N) ** 2).astype(np.float32)[:, None]
+        self.reset(0.0)
+
+    def reset(self, pos):
+        self.p = float(pos)          # posición nominal (en el tema) de la próxima trama
+        self.head = float(pos)       # posición (en el tema) de la próxima muestra a entregar
+        self.tail = None             # mitad final de la trama anterior, ya con ventana (se suma a la próxima)
+        self.prev_c = None           # dónde empezó de verdad la trama anterior
+        self.cola = []               # tramas generadas pendientes de entregar: [array, desplazamiento, rate]
+        self.fin = False
+
+    @staticmethod
+    def _tomar(a, ini, n):
+        """a[ini:ini+n], con ceros fuera del audio."""
+        L = len(a)
+        if ini >= 0 and ini + n <= L:
+            return a[ini:ini + n]
+        out = np.zeros((n, 2), dtype=np.float32)
+        d0, d1 = max(0, ini), min(L, ini + n)
+        if d1 > d0:
+            out[d0 - ini:d1 - ini] = a[d0:d1]
+        return out
+
+    def _generar(self, audio, rate):
+        N, HS = self.N, self.HS
+        if self.p >= len(audio):
+            self.fin = True
+            return False
+        if self.prev_c is None:                        # arranque (o salto de posición): la primera mitad sale SIN ventana,
+            c = int(round(self.p))                     # idéntica al tema, para empalmar sin clic con lo que sonaba antes
+            fr = self._tomar(audio, c, N)
+            out = fr[:HS].copy()
+            self.tail = fr[HS:] * self.W[HS:]
+        else:
+            sg = float(np.clip((1.0 - rate) / 0.01, -1.0, 1.0))            # +1: más lento que el original, -1: más rápido
+            da = int(round(self.DS + (self.DB - self.DS) * (1.0 + sg) / 2.0))     # cuánto se puede atrasar la trama
+            nc = self.DS + self.DB + 1                                            # candidatos (siempre los mismos)
+            lo = int(round(self.p)) - da
+            ref = self._tomar(audio, self.prev_c + HS, HS)                  # continuación natural de la trama anterior
+            seg = self._tomar(audio, lo, nc - 1 + HS)
+            mr = ref[:, 0] + ref[:, 1]
+            ms = seg[:, 0] + seg[:, 1]
+            corr = np.correlate(ms, mr, "valid")                            # parecido de la onda con cada candidato
+            e = np.concatenate(([0.0], np.cumsum(ms.astype(np.float64) ** 2)))
+            en = e[HS:HS + nc] - e[:nc]                                     # energía de cada candidato (normaliza)
+            c = lo + int(np.argmax(corr / np.sqrt(en + 1e-3)))
+            fr = self._tomar(audio, c, N) * self.W
+            out = self.tail + fr[:HS]
+            self.tail = fr[HS:]
+        self.prev_c = c
+        self.p += HS * rate
+        self.cola.append([out, 0, rate])
+        return True
+
+    def leer(self, audio, frames, rate):
+        """Entrega `frames` muestras estiradas a `rate` (1,0 = original). Devuelve (audio, terminó)."""
+        out = np.zeros((frames, 2), dtype=np.float32)
+        lleno = 0
+        while lleno < frames:
+            if not self.cola:
+                if self.fin or not self._generar(audio, rate):
+                    return out, True
+            blk = self.cola[0]
+            arr, off, r = blk
+            t = min(frames - lleno, len(arr) - off)
+            out[lleno:lleno + t] = arr[off:off + t]
+            lleno += t
+            self.head += t * r
+            blk[1] = off + t
+            if blk[1] >= len(arr):
+                self.cola.pop(0)
+        return out, False
+
+
 class Deck(QFrame):
     def __init__(self, name, color, on_analysis_cb):
         super().__init__()
@@ -1557,6 +1646,7 @@ class Deck(QFrame):
         self.on_reset_cb = None
         self.lock = threading.Lock()
         self.original_bpm = None
+        self._ws = WsolaFlujo(); self._ws_activo = False; self._ws_exp = None      # estirado de tiempo sin cambiar el tono
 
         self.setAcceptDrops(True)
         self._acento = color
@@ -1706,6 +1796,7 @@ class Deck(QFrame):
             self.audio = None
             self.cursor = 0
             self._cursor_frac = 0.0
+            self._ws_activo = False
         self.analysis = None
         self.original_bpm = None
         self.auto_gain = 1.0
@@ -1829,6 +1920,7 @@ class Deck(QFrame):
         with self.lock:
             self.cursor = 0
             self._cursor_frac = 0.0
+            self._ws_activo = False
 
     RESET_SUAVE_S = 3.0          # el botón Reset vuelve al 100 % progresivamente (si el tema está sonando)
 
@@ -1970,43 +2062,86 @@ class Deck(QFrame):
             pos = self.position_seconds()
             self.lbl_time.setText(f"{fmt_time(pos)} / {fmt_time(self.analysis['duration'])}")
 
+    WSOLA = True            # False: las velocidades distintas de 1,0 cambian el tono (remuestreo, como un disco de vinilo)
+
+    def _render_directo(self, frames, rate):
+        """Lectura sin estirado: exacta a velocidad 1,0 y, si no, por remuestreo cúbico (cambia el tono)."""
+        n_audio = len(self.audio)
+        if abs(rate - 1.0) < 1e-9 and self._cursor_frac == 0.0:
+            chunk = self.audio[self.cursor:self.cursor + frames]
+            if len(chunk) < frames:
+                pad = np.zeros((frames - len(chunk), 2), dtype=np.float32)
+                chunk = np.vstack([chunk, pad])
+                self.playing = False
+            self.cursor += frames
+            return chunk
+        pos = self.cursor + self._cursor_frac + np.arange(frames, dtype=np.float64) * rate
+        i1 = np.floor(pos).astype(np.int64)
+        t = (pos - i1).astype(np.float32)[:, None]
+        if i1[-1] + 2 >= n_audio:
+            self.playing = (i1[0] + 2 < n_audio)
+        idx = np.clip(np.stack([i1 - 1, i1, i1 + 1, i1 + 2]), 0, n_audio - 1)
+        p0, p1, p2, p3 = (self.audio[idx[k]] for k in range(4))
+        t2 = t * t; t3 = t2 * t
+        y = 0.5 * ((2 * p1) + (-p0 + p2) * t
+                   + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
+                   + (-p0 + 3 * p1 - 3 * p2 + p3) * t3)
+        valid = (pos < n_audio - 1)[:, None]
+        total = self._cursor_frac + frames * rate
+        int_adv = int(total)
+        self._cursor_frac = total - int_adv
+        self.cursor += int_adv
+        return (y * valid).astype(np.float32)
+
+    def _render_wsola(self, frames, rate):
+        """Lectura con WSOLA: la velocidad cambia pero el tono se mantiene. El cursor sigue la posición real en el tema."""
+        salto = False
+        if not self._ws_activo or self._ws_exp != (self.cursor, self._cursor_frac):
+            salto = self._ws_activo                                  # había estirado en marcha: es un salto de posición
+            self._ws.reset(self.cursor + self._cursor_frac)          # arranque, o alguien movió el cursor (salto, manito…)
+            self._ws_activo = True
+        y, fin = self._ws.leer(self.audio, frames, float(np.clip(rate, 0.5, 2.0)))
+        if salto:
+            k = min(128, frames)
+            y[:k] *= np.linspace(0.0, 1.0, k, dtype=np.float32)[:, None]      # entrada suave: sin chasquido al saltar
+        h = self._ws.head
+        self.cursor = int(h)
+        self._cursor_frac = h - self.cursor
+        self._ws_exp = (self.cursor, self._cursor_frac)
+        if fin or self.cursor >= len(self.audio) - 2:
+            self.playing = False
+        return y
+
     def render(self, frames):
         out = np.zeros((frames, 2), dtype=np.float32)
         with self.lock:
             if not self.playing or self.audio is None:
                 return out
             rate = self.rate_eff
-            n_audio = len(self.audio)
-
             ganancia_total = self.auto_gain * NIVEL_V2   # el volumen (por bandas) lo aplica el mezclador
-
-            if abs(rate - 1.0) < 1e-9 and self._cursor_frac == 0.0:
-                end = self.cursor + frames
-                chunk = self.audio[self.cursor:end]
-                if len(chunk) < frames:
-                    pad = np.zeros((frames - len(chunk), 2), dtype=np.float32)
-                    chunk = np.vstack([chunk, pad])
-                    self.playing = False
-                out[:] = chunk * ganancia_total
-                self.cursor += frames
-            else:
-                pos = self.cursor + self._cursor_frac + np.arange(frames, dtype=np.float64) * rate
-                i1 = np.floor(pos).astype(np.int64)
-                t = (pos - i1).astype(np.float32)[:, None]
-                if i1[-1] + 2 >= n_audio:
-                    self.playing = (i1[0] + 2 < n_audio)
-                idx = np.clip(np.stack([i1 - 1, i1, i1 + 1, i1 + 2]), 0, n_audio - 1)
-                p0, p1, p2, p3 = (self.audio[idx[k]] for k in range(4))
-                t2 = t * t; t3 = t2 * t
-                y = 0.5 * ((2 * p1) + (-p0 + p2) * t
-                           + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
-                           + (-p0 + 3 * p1 - 3 * p2 + p3) * t3)
-                valid = (pos < n_audio - 1)[:, None]
-                out[:] = (y * valid).astype(np.float32) * ganancia_total
-                total = self._cursor_frac + frames * rate
-                int_adv = int(total)
-                self._cursor_frac = total - int_adv
-                self.cursor += int_adv
+            try:
+                if Deck.WSOLA and abs(rate - 1.0) > 1e-9:
+                    y = self._render_wsola(frames, rate)
+                elif self._ws_activo:                    # vuelve a 1,0: unos ms de fundido entre el estirado y la lectura directa
+                    if self._ws_exp == (self.cursor, self._cursor_frac):
+                        h0 = self._ws.head
+                        y_ws, _ = self._ws.leer(self.audio, frames, 1.0)
+                        self.cursor = int(h0); self._cursor_frac = h0 - self.cursor
+                        y_d = self._render_directo(frames, rate)
+                        f = np.linspace(0.0, 1.0, frames, dtype=np.float32)[:, None]
+                        y = y_ws * (1.0 - f) + y_d * f
+                    else:
+                        y = self._render_directo(frames, rate)
+                    self._ws_activo = False
+                else:
+                    y = self._render_directo(frames, rate)
+            except Exception:
+                import traceback; traceback.print_exc()
+                Deck.WSOLA = False                       # ante cualquier fallo se vuelve al remuestreo de siempre
+                self._ws_activo = False
+                print("[audio] WSOLA desactivado por un error: se usa el remuestreo")
+                y = self._render_directo(frames, rate)
+            out[:] = y * ganancia_total
         return out
 
 
@@ -3949,6 +4084,13 @@ class AutoMix(QMainWindow):
         # (el siguiente tema es el que sigue en la lista, ordenada por BPM, y la mezcla automática arranca al llegar a la marca).
         self.chk_armonico = _OpcionApagada()
         self.chk_frases = _OpcionApagada()
+        self.chk_wsola = QCheckBox("🎚 Tono fijo (WSOLA)")
+        self.chk_wsola.setToolTip("Al cambiar la velocidad de un tema (tempo, enganche, mezcla) el tono NO cambia: el audio se estira con WSOLA.\n"
+                                  "Destildado: la velocidad cambia el tono, como en un disco de vinilo.")
+        self.chk_wsola.setChecked(bool(leer_config().get("wsola", True)))
+        Deck.WSOLA = self.chk_wsola.isChecked()
+        self.chk_wsola.toggled.connect(self._wsola_cambio)
+        lib_lay.addWidget(self.chk_wsola)
         lib_lay.addWidget(EtiquetaElidida("Arrastrá un tema a Deck A o B"))
         self.ed_filtro.textChanged.connect(self._filtrar_biblioteca)
         self.biblioteca.cambio.connect(self._biblioteca_cambio)
@@ -4980,6 +5122,11 @@ class AutoMix(QMainWindow):
         for i in range(self.biblioteca.count()):
             it = self.biblioteca.item(i)
             it.setHidden(bool(t) and t not in it.text().lower())
+
+    def _wsola_cambio(self, v):
+        Deck.WSOLA = bool(v)
+        guardar_config(wsola=bool(v))
+        log("audio", "tono fijo (WSOLA) " + ("activado" if v else "desactivado: la velocidad cambia el tono"))
 
     def _biblioteca_cambio(self):
         self.lbl_lib.setText(f"📁 Biblioteca ({self.biblioteca.count()})")
