@@ -4762,7 +4762,13 @@ class AutoMix(QMainWindow):
             "QPushButton:disabled { background:#3a3322; color:#7a7155; border-color:#4a422c; }")
         _glow = QGraphicsDropShadowEffect(self.btn_mix); _glow.setBlurRadius(26); _glow.setOffset(0, 2); _glow.setColor(QColor(255, 160, 0, 130))
         self.btn_mix.setGraphicsEffect(_glow)
-        der.addWidget(self.btn_mix)
+        # El botón Mezclar va abajo, a la derecha (debajo del Deck B), a la altura de la fila "Rejilla B"
+        col_mix = QVBoxLayout(); col_mix.setContentsMargins(0, 0, 0, 0); col_mix.setSpacing(0)
+        col_mix.addSpacing(34)                    # salta la fila "Rejilla A" (30 px + 4 de separación)
+        self.btn_mix.setMinimumWidth(230)
+        col_mix.addWidget(self.btn_mix)
+        col_mix.addStretch(1)
+        self._fila_herr.addLayout(col_mix)
         self.spin_mix.setFixedWidth(58)           # corto: solo el número
         f_dur = self._fila_duracion               # la duración vive debajo de los dos decks (se arma acá porque el spin se crea antes)
         f_dur.addStretch(1)
