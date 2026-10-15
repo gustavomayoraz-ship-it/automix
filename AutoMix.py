@@ -827,19 +827,25 @@ def _grilla_final(res, linea):
     res["grid"] = 1
 
 
+BPM_CORREGIDO_MIN, BPM_CORREGIDO_MAX = 50.0, 220.0      # la corrección a mano nunca deja un BPM fuera de esto
+
+
 def grilla_manual(res, factor=1.0, uno_en=None):
     """Corrección a mano de la grilla de un tema (modifica `res`).
     factor 2 / 0.5 = BPM doble / mitad (se conserva la fase) · uno_en = segundo donde cae el "1" de un compás."""
     bpm0 = float(res["bpm"])
     bt0 = np.asarray(res.get("beats_full") or [], dtype=np.float64)
+    d0 = np.asarray(res.get("downbeats_full") or [], dtype=np.float64)
     if len(bt0) >= 2:
         slope = float(np.median(np.diff(bt0)))
-        icpt = float(bt0[0])
+        icpt = float(d0[0]) if len(d0) else float(bt0[0])         # se ancla en el primer "1": ×2 y ÷2 se pueden deshacer sin perder la fase
     else:
         slope = 60.0 / bpm0
-        icpt = 0.0
+        icpt = float(d0[0]) if len(d0) else 0.0
     if factor and factor != 1.0:
         slope = slope / float(factor)
+    if not (BPM_CORREGIDO_MIN <= 60.0 / slope <= BPM_CORREGIDO_MAX):
+        raise ValueError(f"{60.0 / slope:.0f} BPM queda fuera del rango razonable ({BPM_CORREGIDO_MIN:.0f}-{BPM_CORREGIDO_MAX:.0f})")
     if uno_en is not None:
         icpt = float(uno_en)                    # este golpe pasa a ser un "1": la grilla se re-ancla acá
         modo_fijo = 0
@@ -868,6 +874,23 @@ def grilla_manual(res, factor=1.0, uno_en=None):
     res["grid"] = 1
     res["manual"] = True
     return res
+
+
+def plegar_bpm(res):
+    """Si el BPM de un tema es absurdo (fuera de 50-220), lo lleva por octavas (×2 / ÷2) al rango musical.
+    Devuelve True si cambió algo. Cubre errores del análisis y datos dañados."""
+    try:
+        b = float(res.get("bpm") or 0.0)
+        if b <= 0 or BPM_CORREGIDO_MIN <= b <= BPM_CORREGIDO_MAX:
+            return False
+        k = min(range(-12, 13), key=lambda k: abs(math.log(b * 2.0 ** k / 105.0)))
+        if k == 0:
+            return False
+        grilla_manual(res, 2.0 ** k)
+        res.pop("manual", None)                    # fue un arreglo automático, no una corrección del usuario
+        return True
+    except Exception:
+        return False
 
 
 def desfase_rejilla_bombos(res):
@@ -1629,10 +1652,10 @@ class WsolaFlujo:
     La ventana de búsqueda es asimétrica: se deja poco margen hacia el lado en que se acumularía el corrimiento de
     tiempo (según el tema vaya más rápido o más lento) y mucho hacia el otro, para que el audio quede siempre a
     pocos milisegundos de donde marca el cursor y el emparejado de los dos decks no se desfase."""
-    N = 1536                 # largo de cada trama (35 ms a 44,1 kHz)
-    HS = 768                 # avance de salida entre tramas (50 % de solape)
-    DS = 48                  # margen corto de búsqueda (muestras): lado donde se acumularía el corrimiento
-    DB = 160                 # margen largo de búsqueda (muestras): lado por el que se puede "volver"
+    N = 2048                 # largo de cada trama (46 ms a 44,1 kHz): más largo = voces más limpias
+    HS = 1024                # avance de salida entre tramas (50 % de solape)
+    DS = 256                 # margen corto de búsqueda (muestras): lado donde se acumularía el corrimiento
+    DB = 512                 # margen largo de búsqueda (muestras): lado por el que se puede "volver"
 
     def __init__(self):
         self.W = (np.sin(np.pi * (np.arange(self.N) + 0.5) / self.N) ** 2).astype(np.float32)[:, None]
@@ -1734,6 +1757,7 @@ class Deck(QFrame):
         self.lock = threading.Lock()
         self.original_bpm = None
         self._ws = WsolaFlujo(); self._ws_activo = False; self._ws_exp = None      # estirado de tiempo sin cambiar el tono
+        self._ws_modo = False
 
         self.setAcceptDrops(True)
         self._acento = color
@@ -1964,6 +1988,12 @@ class Deck(QFrame):
             return
         _limpiar_grilla_cache(res)
         self._afinar_bpm(res)
+        if plegar_bpm(res):                                   # BPM absurdo (p. ej. 1535): se lleva al rango musical y se guarda
+            log(f"deck {self.name}", f"BPM fuera de rango corregido → {res['bpm']:.1f}")
+            try:
+                _guardar_cache(CACHE_DIR / (Path(self.path).stem + ".json"), res)
+            except Exception:
+                pass
         self.analysis = res
         self.original_bpm = res["bpm"]
         if not getattr(self, "_ag_listo", False):
@@ -1999,7 +2029,11 @@ class Deck(QFrame):
             return False
         try:
             with self.lock:
-                grilla_manual(self.analysis, factor, uno_en)
+                try:
+                    grilla_manual(self.analysis, factor, uno_en)
+                except ValueError as e:
+                    self.motivo_rechazo = str(e)
+                    return False
                 if usuario:
                     self.analysis["usuario"] = True          # la corrigió el usuario: el modo Auto ya no la toca
                 self.original_bpm = self.analysis["bpm"]
@@ -2224,6 +2258,21 @@ class Deck(QFrame):
         self.cursor += int_adv
         return (y * valid).astype(np.float32)
 
+    WS_ENTRA = 0.020          # el estirado (WSOLA) se usa solo si la velocidad se aparta más de esto de 1,0 ...
+    WS_SALE = 0.012           # ... y se abandona recién por debajo de esto (histéresis: no cambia de modo a cada rato)
+
+    def _ws_usar(self, rate):
+        """Con diferencias de velocidad chicas (< ~2 %) el WSOLA agrega un temblor leve y el remuestreo directo solo
+        cambia el tono unos centésimos de semitono (imperceptible), así que ahí se lee directo."""
+        d = abs(rate - 1.0)
+        if d <= 1e-9:
+            self._ws_modo = False
+        elif self._ws_modo:
+            self._ws_modo = d >= self.WS_SALE
+        else:
+            self._ws_modo = d > self.WS_ENTRA
+        return self._ws_modo
+
     def _render_wsola(self, frames, rate):
         """Lectura con WSOLA: la velocidad cambia pero el tono se mantiene. El cursor sigue la posición real en el tema."""
         salto = False
@@ -2251,12 +2300,12 @@ class Deck(QFrame):
             rate = self.rate_eff
             ganancia_total = self.auto_gain * NIVEL_V2   # el volumen (por bandas) lo aplica el mezclador
             try:
-                if Deck.WSOLA and abs(rate - 1.0) > 1e-9:
+                if Deck.WSOLA and self._ws_usar(rate):
                     y = self._render_wsola(frames, rate)
-                elif self._ws_activo:                    # vuelve a 1,0: unos ms de fundido entre el estirado y la lectura directa
+                elif self._ws_activo:                    # deja el estirado (rate 1,0 o muy cerca): unos ms de fundido hacia la lectura directa
                     if self._ws_exp == (self.cursor, self._cursor_frac):
                         h0 = self._ws.head
-                        y_ws, _ = self._ws.leer(self.audio, frames, 1.0)
+                        y_ws, _ = self._ws.leer(self.audio, frames, float(np.clip(rate, 0.5, 2.0)))
                         self.cursor = int(h0); self._cursor_frac = h0 - self.cursor
                         y_d = self._render_directo(frames, rate)
                         f = np.linspace(0.0, 1.0, frames, dtype=np.float32)[:, None]
@@ -5372,10 +5421,13 @@ class AutoMix(QMainWindow):
             except Exception:
                 pass
             t_uno = max(0.0, t_uno)
+        deck.motivo_rechazo = None
         if deck.corregir_rejilla(factor=factor, uno_en=t_uno, usuario=True):
             msg = ("BPM ×2" if factor == 2.0 else "BPM ÷2") if not uno else f"el 1 queda en {fmt_time(t_uno)}"
             log(f"deck {deck.name}", f"rejilla: {msg} → {deck.analysis['bpm']:.2f} BPM")
             self._set_status(f"🎯 Deck {deck.name}: {msg} · {deck.analysis['bpm']:.1f} BPM (guardado)")
+        elif getattr(deck, "motivo_rechazo", None):
+            self._set_status(f"⚠️ Deck {deck.name}: no se cambió, {deck.motivo_rechazo}")
 
     def _estilo_auto_rej(self):
         on = self.btn_auto_rej.isChecked()
@@ -5423,6 +5475,15 @@ class AutoMix(QMainWindow):
             self._rej_visto[d.name] = (d.path, id(d.analysis))
         partes = []
         cambio = False                      # ¿se movió alguna grilla? (solo entonces hace falta volver a emparejar)
+        for d in cargados:                  # 0) un BPM absurdo (fuera de 50-220) se lleva primero al rango musical
+            if not d.playing and not d.analysis.get("usuario") and plegar_bpm(d.analysis):
+                d.original_bpm = d.analysis["bpm"]; d._db_cache = None; d._update_bpm_label()
+                try:
+                    _guardar_cache(CACHE_DIR / (Path(d.path).stem + ".json"), d.analysis)
+                except Exception:
+                    pass
+                cambio = True
+                partes.append(f"Deck {d.name}: BPM fuera de rango → {d.analysis['bpm']:.1f}")
         # 1) octava
         if len(cargados) == 2:
             ba, bb = float(a.original_bpm), float(b.original_bpm)
