@@ -5100,7 +5100,7 @@ class AutoMix(QMainWindow):
             h = min(self.height(), ag.height() - marco_h)
             self.resize(w, h)
             if esquina:
-                self.move(ag.left(), ag.top())
+                self.move(ag.left() + 4, ag.top() + 4)          # separada 4 px de los bordes
             else:
                 self.move(ag.left() + (ag.width() - (w + marco_w)) // 2,
                           ag.top() + (ag.height() - (h + marco_h)) // 2)
