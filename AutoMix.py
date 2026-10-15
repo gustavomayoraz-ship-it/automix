@@ -870,6 +870,37 @@ def grilla_manual(res, factor=1.0, uno_en=None):
     return res
 
 
+def desfase_rejilla_bombos(res):
+    """Cuánto está corrida la grilla respecto de los bombos (segundos, mediana). None si no hay datos suficientes
+    o los bombos no son coherentes con la grilla (música sin bombo marcado)."""
+    bt = np.asarray(res.get("beats_full") or [], dtype=np.float64)
+    ks = np.asarray(res.get("kicks_full") or [], dtype=np.float64)
+    if len(bt) < 16 or len(ks) < 16:
+        return None
+    per = float(np.median(np.diff(bt)))
+    i = np.clip(np.searchsorted(bt, ks), 1, len(bt) - 1)
+    cerca = np.where(np.abs(ks - bt[i - 1]) <= np.abs(ks - bt[i]), bt[i - 1], bt[i])
+    d = ks - cerca
+    d = d[np.abs(d) < 0.35 * per]
+    if len(d) < 16:
+        return None
+    med = float(np.median(d))
+    mad = float(np.median(np.abs(d - med)))
+    if mad > 0.06 * per or len(d) < 0.3 * len(bt):       # bombos dispersos: no es una medida confiable
+        return None
+    return med
+
+
+def desplazar_rejilla(res, seg):
+    """Corre toda la grilla (tiempos y compases) `seg` segundos."""
+    for k_full, k_draw in (("beats_full", "beats"), ("downbeats_full", "downbeats")):
+        res[k_full] = [float(x) + seg for x in (res.get(k_full) or []) if float(x) + seg >= 0.0]
+        res[k_draw] = [float(x) + seg for x in (res.get(k_draw) or []) if float(x) + seg >= 0.0]
+    res["grid"] = 1
+    res["manual"] = True
+    return res
+
+
 def _limpiar_grilla_cache(res):
     """Versión barata (sin audio) para análisis ya guardados. Devuelve True si la grilla quedó regular."""
     if res.get("grid") == 1:
@@ -1942,13 +1973,35 @@ class Deck(QFrame):
         if self.on_analysis_cb:
             self.on_analysis_cb(self.name, res)
 
-    def corregir_rejilla(self, factor=1.0, uno_en=None):
+    def centrar_rejilla(self):
+        """Mueve la grilla para que los tiempos caigan sobre los bombos. Devuelve el corrimiento en ms (None = no se pudo medir)."""
+        if not self.analysis or not self.path:
+            return None
+        off = desfase_rejilla_bombos(self.analysis)
+        if off is None:
+            return None
+        if abs(off) < 0.008:                              # ya está bien centrada (menos de 8 ms)
+            return 0.0
+        with self.lock:
+            desplazar_rejilla(self.analysis, off)
+            self._db_cache = None
+        try:
+            _guardar_cache(CACHE_DIR / (Path(self.path).stem + ".json"), self.analysis)
+        except Exception:
+            import traceback; traceback.print_exc()
+        if self.on_analysis_cb:
+            self.on_analysis_cb(self.name, self.analysis)
+        return off * 1000.0
+
+    def corregir_rejilla(self, factor=1.0, uno_en=None, usuario=False):
         """Botones ÷2 / ×2 / ①. Cambia la grilla del tema cargado, la guarda en su caché y avisa a la ventana."""
         if not self.analysis or not self.path:
             return False
         try:
             with self.lock:
                 grilla_manual(self.analysis, factor, uno_en)
+                if usuario:
+                    self.analysis["usuario"] = True          # la corrigió el usuario: el modo Auto ya no la toca
                 self.original_bpm = self.analysis["bpm"]
                 self._db_cache = None
             self._update_bpm_label()
@@ -4302,10 +4355,13 @@ class AutoMix(QMainWindow):
         izq.addStretch(1)                        # la duración queda centrada en el hueco entre los decks y el panel de abajo
         self._fila_duracion = QHBoxLayout(); self._fila_duracion.setContentsMargins(0, 0, 0, 0); self._fila_duracion.setSpacing(6)
         izq.addLayout(self._fila_duracion)       # a la altura del botón "Valores por defecto", justo debajo de los dos decks
-        self._fila_grab = QHBoxLayout(); self._fila_grab.setContentsMargins(0, 0, 0, 0); self._fila_grab.setSpacing(6)
-        izq.addLayout(self._fila_grab)           # herramientas: grabación de la mezcla (y las que vengan)
-        self._fila_rej = QHBoxLayout(); self._fila_rej.setContentsMargins(0, 0, 0, 0); self._fila_rej.setSpacing(4)
-        izq.addLayout(self._fila_rej)            # rejilla de BPM / compases de cada deck
+        self._fila_herr = QHBoxLayout(); self._fila_herr.setContentsMargins(0, 0, 0, 0); self._fila_herr.setSpacing(18)
+        izq.addLayout(self._fila_herr)           # herramientas: a la izquierda la rejilla (en vertical), a la derecha la grabación
+        self._fila_rej = QVBoxLayout(); self._fila_rej.setContentsMargins(0, 0, 0, 0); self._fila_rej.setSpacing(4)
+        self._fila_grab = QVBoxLayout(); self._fila_grab.setContentsMargins(0, 0, 0, 0); self._fila_grab.setSpacing(4)
+        self._fila_herr.addLayout(self._fila_rej)
+        self._fila_herr.addLayout(self._fila_grab)
+        self._fila_herr.addStretch(1)
         izq.addStretch(1)
         decks_row.addLayout(izq, stretch=1)
         decks_row.addWidget(self.panel_cruce, alignment=Qt.AlignmentFlag.AlignTop)
@@ -4399,24 +4455,48 @@ class AutoMix(QMainWindow):
         self.btn_carpeta_grab.setToolTip("Abrir la carpeta con las mezclas grabadas")
         self.btn_carpeta_grab.clicked.connect(self._abrir_carpeta_grabaciones)
         self.lbl_grab = QLabel("")
-        self._fila_grab.addWidget(self.btn_grabar)
-        self._fila_grab.addWidget(self.btn_carpeta_grab)
-        self._fila_grab.addWidget(self.lbl_grab, 1)
+        self.lbl_grab.setWordWrap(True); self.lbl_grab.setStyleSheet("color:#9fe3c6; font-size:12px;")
+        fila_g = QHBoxLayout(); fila_g.setSpacing(6); fila_g.setContentsMargins(0, 0, 0, 0)
+        fila_g.addWidget(self.btn_grabar); fila_g.addWidget(self.btn_carpeta_grab)
+        self._fila_grab.addLayout(fila_g)
+        self._fila_grab.addWidget(self.lbl_grab)
+        self._fila_grab.addStretch(1)
         self._t_grab = QTimer(self); self._t_grab.setInterval(250)
         self._t_grab.timeout.connect(self._tic_grabacion)
         for deck, col in ((self.deck_a, COLOR_DECK_A), (self.deck_b, COLOR_DECK_B)):
-            self._fila_rej.addWidget(QLabel(f"<b style='color:{col}'>Rejilla {deck.name}</b>"))
+            fila_d = QHBoxLayout(); fila_d.setSpacing(4); fila_d.setContentsMargins(0, 0, 0, 0)
+            fila_d.addWidget(QLabel(f"<b style='color:{col}'>Rejilla {deck.name}</b>"))
             for txt, tip, fn in (
                 ("÷2", "BPM a la mitad (si el análisis detectó el doble)", lambda _=False, d=deck: self._rejilla(d, factor=0.5)),
                 ("×2", "BPM al doble (si el análisis detectó la mitad)", lambda _=False, d=deck: self._rejilla(d, factor=2.0)),
                 ("①", "Poner el \"1\" del compás en la posición actual (pausá el tema justo en el golpe fuerte con la manito)", lambda _=False, d=deck: self._rejilla(d, uno=True)),
             ):
-                b = QPushButton(txt); b.setFixedSize(44, 34); b.setToolTip(tip)
+                b = QPushButton(txt); b.setFixedSize(44, 30); b.setToolTip(tip)
                 b.setStyleSheet("QPushButton { padding:0px; font-size:16px; font-weight:bold; }")
-                b.clicked.connect(fn)
-                self._fila_rej.addWidget(b)
-            self._fila_rej.addSpacing(14)
-        self._fila_rej.addStretch(1)
+                b.clicked.connect(fn); b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                fila_d.addWidget(b)
+            fila_d.addStretch(1)
+            self._fila_rej.addLayout(fila_d)
+        self.btn_auto_rej = QPushButton("🎯 Auto")
+        self.btn_auto_rej.setCheckable(True)
+        self.btn_auto_rej.setFixedHeight(30); self.btn_auto_rej.setMinimumWidth(130)
+        self.btn_auto_rej.setToolTip("Auto-grilla (verde = activada, rojo = desactivada).\nActivada: revisa sin parar los temas que entran, "
+                                     "corrige el BPM doble/mitad, centra la grilla en los bombos y los empareja (tempo + compases).")
+        self.btn_auto_rej.setChecked(bool(leer_config().get("auto_grilla", False)))
+        for _b in (self.btn_auto_rej, self.btn_grabar, self.btn_carpeta_grab):
+            _b.setFocusPolicy(Qt.FocusPolicy.NoFocus)         # que la barra espaciadora / Enter nunca los active por accidente
+        self._estilo_auto_rej()
+        self.btn_auto_rej.toggled.connect(self._auto_rej_cambio)
+        self._rej_visto = {}
+        self._t_auto_rej = QTimer(self); self._t_auto_rej.setInterval(800)
+        self._t_auto_rej.timeout.connect(self._vigilar_rejilla)
+        if self.btn_auto_rej.isChecked():
+            self._t_auto_rej.start()
+        fila_au = QHBoxLayout(); fila_au.setContentsMargins(0, 0, 0, 0)
+        fila_au.addWidget(self.btn_auto_rej); fila_au.addStretch(1)
+        self._fila_rej.addLayout(fila_au)
+        self.lbl_rej = QLabel(""); self.lbl_rej.setWordWrap(True); self.lbl_rej.setStyleSheet("color:#9fe3c6; font-size:12px;")
+        izq.addWidget(self.lbl_rej)               # lo que encontró y corrigió el botón Auto
         self.btn_esquina = QPushButton("↖")
         self.btn_esquina.setFixedSize(76, 52)
         self.btn_esquina.setStyleSheet("QPushButton { font-size:34px; padding:0px; }")
@@ -5291,10 +5371,107 @@ class AutoMix(QMainWindow):
             except Exception:
                 pass
             t_uno = max(0.0, t_uno)
-        if deck.corregir_rejilla(factor=factor, uno_en=t_uno):
+        if deck.corregir_rejilla(factor=factor, uno_en=t_uno, usuario=True):
             msg = ("BPM ×2" if factor == 2.0 else "BPM ÷2") if not uno else f"el 1 queda en {fmt_time(t_uno)}"
             log(f"deck {deck.name}", f"rejilla: {msg} → {deck.analysis['bpm']:.2f} BPM")
             self._set_status(f"🎯 Deck {deck.name}: {msg} · {deck.analysis['bpm']:.1f} BPM (guardado)")
+
+    def _estilo_auto_rej(self):
+        on = self.btn_auto_rej.isChecked()
+        self.btn_auto_rej.setText("Auto ON" if on else "Auto OFF")
+        col, fondo = ("#2ee59d", "#0f5a3c") if on else ("#ff5a6a", "#5a1620")
+        self.btn_auto_rej.setStyleSheet(f"QPushButton {{ padding:0px 2px; font-size:13px; font-weight:bold; color:#ffffff;"
+                                        f" background:{fondo}; border:2px solid {col}; border-radius:8px; }}")
+
+    def _auto_rej_cambio(self, on):
+        self._estilo_auto_rej()
+        guardar_config(auto_grilla=bool(on))
+        log("rejilla", "auto-grilla " + ("ACTIVADA" if on else "DESACTIVADA") + " (se cambió el botón)")
+        if on:
+            self._rej_visto = {}
+            self._t_auto_rej.start()
+            self._auto_rejilla(forzar=True)
+        else:
+            self._t_auto_rej.stop()
+            self.lbl_rej.setText("Auto-grilla desactivada")
+            log("rejilla", "auto-grilla desactivada")
+            self._set_status("🎯 Auto-grilla desactivada")
+
+    def _vigilar_rejilla(self):
+        """Con Auto activado: cada vez que entra un tema nuevo (o termina su análisis) se revisa y empareja su grilla."""
+        try:
+            nuevo = False
+            for d in (self.deck_a, self.deck_b):
+                clave = (d.path, id(d.analysis)) if d.analysis else None
+                if clave is not None and self._rej_visto.get(d.name) != clave:
+                    nuevo = True
+            if nuevo:
+                self._auto_rejilla()
+        except Exception:
+            import traceback; traceback.print_exc()
+
+    def _auto_rejilla(self, forzar=False):
+        """Botón 🎯 Auto. Para los dos temas cargados: (1) corrige el BPM doble/mitad respecto del otro, (2) centra la grilla
+        sobre los bombos, (3) empareja tempo y compases (si los dos suenan). Siempre cuenta en pantalla qué encontró."""
+        a, b = self.deck_a, self.deck_b
+        cargados = [d for d in (a, b) if d.analysis and d.original_bpm]
+        if not cargados:
+            self._avisar_rejilla("⚠️ Cargá un tema y esperá a que termine el análisis")
+            return
+        for d in cargados:
+            self._rej_visto[d.name] = (d.path, id(d.analysis))
+        partes = []
+        # 1) octava
+        if len(cargados) == 2:
+            ba, bb = float(a.original_bpm), float(b.original_bpm)
+            if max(ba, bb) / min(ba, bb) > 1.12:
+                mejor = None
+                for deck, bpm, otro_bpm in ((a, ba, bb), (b, bb, ba)):
+                    if deck.playing:                       # al que está sonando no se le cambia el BPM (se oiría)
+                        continue
+                    for f in (0.5, 2.0):
+                        r = max(bpm * f, otro_bpm) / min(bpm * f, otro_bpm)
+                        clave = (round(r, 3), 0 if 70.0 <= bpm * f <= 180.0 else 1)
+                        if mejor is None or clave < mejor[0]:
+                            mejor = (clave, deck, f, r)
+                if mejor and mejor[3] < 1.12 and mejor[3] < max(ba, bb) / min(ba, bb) * 0.8 and not mejor[1].analysis.get("usuario"):
+                    _, deck, f, r = mejor
+                    if deck.corregir_rejilla(factor=f):
+                        partes.append(f"Deck {deck.name}: BPM {'×2' if f == 2.0 else '÷2'} → {deck.analysis['bpm']:.1f}")
+        # 2) grilla centrada en los bombos
+        for d in cargados:
+            if d.analysis.get("usuario"):
+                partes.append(f"Deck {d.name}: grilla corregida por vos, no se toca")
+                continue
+            ms = d.centrar_rejilla()
+            if ms is None:
+                partes.append(f"Deck {d.name}: bombos poco claros, grilla sin tocar")
+            elif ms == 0.0:
+                partes.append(f"Deck {d.name}: grilla ya centrada en los bombos")
+            else:
+                partes.append(f"Deck {d.name}: grilla corrida {ms:+.0f} ms sobre los bombos")
+        self.timeline.redraw()
+        # 3) emparejar
+        if len(cargados) == 2:
+            ba, bb = float(a.original_bpm), float(b.original_bpm)
+            if not self._bpm_compatibles():
+                partes.append(f"BPM muy distintos ({ba:.0f} y {bb:.0f}): no se emparejan")
+            elif a.playing and b.playing:
+                entra = b if a.volume >= b.volume else a
+                entra.tempo_manual = False
+                self._auto_sync(entra)
+                self._alinear_ya(entra)
+                partes.append(f"Deck {entra.name} emparejado con {'A' if entra is b else 'B'} (tempo y compases)")
+            else:
+                partes.append("el emparejamiento se hace al darle play a los dos")
+        else:
+            partes.append("cargá el otro deck para emparejar")
+        self._avisar_rejilla(" · ".join(partes))
+
+    def _avisar_rejilla(self, msg):
+        log("rejilla", "auto: " + msg)
+        self._set_status("🎯 " + msg)
+        self.lbl_rej.setText(msg)
 
     def _a_la_esquina(self):
         """Botón ↖: la ventana vuelve al tamaño mínimo de arranque y queda pegada a la esquina superior izquierda.

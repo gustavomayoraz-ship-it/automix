@@ -5,3 +5,4 @@ dependencias_offline/
 *.log
 .venv/
 venv/
+grabaciones/
