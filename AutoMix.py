@@ -1973,7 +1973,7 @@ class Deck(QFrame):
         if self.on_analysis_cb:
             self.on_analysis_cb(self.name, res)
 
-    def centrar_rejilla(self):
+    def centrar_rejilla(self, avisar=True):
         """Mueve la grilla para que los tiempos caigan sobre los bombos. Devuelve el corrimiento en ms (None = no se pudo medir)."""
         if not self.analysis or not self.path:
             return None
@@ -1989,11 +1989,11 @@ class Deck(QFrame):
             _guardar_cache(CACHE_DIR / (Path(self.path).stem + ".json"), self.analysis)
         except Exception:
             import traceback; traceback.print_exc()
-        if self.on_analysis_cb:
+        if avisar and self.on_analysis_cb:
             self.on_analysis_cb(self.name, self.analysis)
         return off * 1000.0
 
-    def corregir_rejilla(self, factor=1.0, uno_en=None, usuario=False):
+    def corregir_rejilla(self, factor=1.0, uno_en=None, usuario=False, avisar=True):
         """Botones ÷2 / ×2 / ①. Cambia la grilla del tema cargado, la guarda en su caché y avisa a la ventana."""
         if not self.analysis or not self.path:
             return False
@@ -2009,7 +2009,7 @@ class Deck(QFrame):
                 _guardar_cache(CACHE_DIR / (Path(self.path).stem + ".json"), self.analysis)
             except Exception:
                 import traceback; traceback.print_exc()
-            if self.on_analysis_cb:
+            if avisar and self.on_analysis_cb:
                 self.on_analysis_cb(self.name, self.analysis)
             return True
         except Exception:
@@ -4318,7 +4318,6 @@ class AutoMix(QMainWindow):
         self.chk_wsola.setChecked(bool(leer_config().get("wsola", True)))
         Deck.WSOLA = self.chk_wsola.isChecked()
         self.chk_wsola.toggled.connect(self._wsola_cambio)
-        lib_lay.addWidget(self.chk_wsola)
         lib_lay.addWidget(EtiquetaElidida("Arrastrá un tema a Deck A o B"))
         self.ed_filtro.textChanged.connect(self._filtrar_biblioteca)
         self.biblioteca.cambio.connect(self._biblioteca_cambio)
@@ -4446,20 +4445,22 @@ class AutoMix(QMainWindow):
             self.btn_consola.setVisible(False)
         self._f_dur.insertWidget(self._f_dur.count() - 1, self.btn_consola)   # al costado de Duración, mismo tamaño
         self.btn_grabar = QPushButton("⏺ Grabar mezcla")
-        self.btn_grabar.setFixedHeight(40)
+        self.btn_grabar.setFixedHeight(30)
         self.btn_grabar.setMinimumWidth(190)
         self.btn_grabar.setToolTip("Graba en un .wav todo lo que suena (la mezcla completa, con ecualizador y limitador)")
         self.btn_grabar.clicked.connect(self._alternar_grabacion)
         self.btn_carpeta_grab = QPushButton("📂")
-        self.btn_carpeta_grab.setFixedSize(52, 40)
+        self.btn_carpeta_grab.setFixedSize(52, 30)
         self.btn_carpeta_grab.setToolTip("Abrir la carpeta con las mezclas grabadas")
         self.btn_carpeta_grab.clicked.connect(self._abrir_carpeta_grabaciones)
-        self.lbl_grab = QLabel("")
-        self.lbl_grab.setWordWrap(True); self.lbl_grab.setStyleSheet("color:#9fe3c6; font-size:12px;")
+        self.lbl_grab = EtiquetaElidida("")
+        self.lbl_grab.setFixedHeight(30); self.lbl_grab.setStyleSheet("color:#9fe3c6; font-size:12px;")
         fila_g = QHBoxLayout(); fila_g.setSpacing(6); fila_g.setContentsMargins(0, 0, 0, 0)
         fila_g.addWidget(self.btn_grabar); fila_g.addWidget(self.btn_carpeta_grab)
         self._fila_grab.addLayout(fila_g)
-        self._fila_grab.addWidget(self.lbl_grab)
+        self._fila_grab.addWidget(self.lbl_grab)                 # (el nombre del .wav guardado)
+        self._fila_grab.addWidget(self.chk_wsola)                # misma línea que el botón Auto
+        self.chk_wsola.setFixedHeight(30)
         self._fila_grab.addStretch(1)
         self._t_grab = QTimer(self); self._t_grab.setInterval(250)
         self._t_grab.timeout.connect(self._tic_grabacion)
@@ -5421,6 +5422,7 @@ class AutoMix(QMainWindow):
         for d in cargados:
             self._rej_visto[d.name] = (d.path, id(d.analysis))
         partes = []
+        cambio = False                      # ¿se movió alguna grilla? (solo entonces hace falta volver a emparejar)
         # 1) octava
         if len(cargados) == 2:
             ba, bb = float(a.original_bpm), float(b.original_bpm)
@@ -5436,21 +5438,28 @@ class AutoMix(QMainWindow):
                             mejor = (clave, deck, f, r)
                 if mejor and mejor[3] < 1.12 and mejor[3] < max(ba, bb) / min(ba, bb) * 0.8 and not mejor[1].analysis.get("usuario"):
                     _, deck, f, r = mejor
-                    if deck.corregir_rejilla(factor=f):
+                    if deck.corregir_rejilla(factor=f, avisar=False):
+                        cambio = True
                         partes.append(f"Deck {deck.name}: BPM {'×2' if f == 2.0 else '÷2'} → {deck.analysis['bpm']:.1f}")
         # 2) grilla centrada en los bombos
         for d in cargados:
             if d.analysis.get("usuario"):
                 partes.append(f"Deck {d.name}: grilla corregida por vos, no se toca")
                 continue
-            ms = d.centrar_rejilla()
+            if d.playing:                                     # a un tema que suena no se le mueve la grilla: se oiría un salto
+                partes.append(f"Deck {d.name}: está sonando, grilla sin tocar")
+                continue
+            ms = d.centrar_rejilla(avisar=False)
+            if ms:
+                cambio = True
             if ms is None:
                 partes.append(f"Deck {d.name}: bombos poco claros, grilla sin tocar")
             elif ms == 0.0:
                 partes.append(f"Deck {d.name}: grilla ya centrada en los bombos")
             else:
                 partes.append(f"Deck {d.name}: grilla corrida {ms:+.0f} ms sobre los bombos")
-        self.timeline.redraw()
+        if cambio:
+            self.timeline.redraw()
         # 3) emparejar
         if len(cargados) == 2:
             ba, bb = float(a.original_bpm), float(b.original_bpm)
@@ -5458,10 +5467,13 @@ class AutoMix(QMainWindow):
                 partes.append(f"BPM muy distintos ({ba:.0f} y {bb:.0f}): no se emparejan")
             elif a.playing and b.playing:
                 entra = b if a.volume >= b.volume else a
-                entra.tempo_manual = False
-                self._auto_sync(entra)
-                self._alinear_ya(entra)
-                partes.append(f"Deck {entra.name} emparejado con {'A' if entra is b else 'B'} (tempo y compases)")
+                if self.magnet_on and not cambio:
+                    partes.append("los dos suenan y ya están emparejados")        # nada que corregir: no se vuelve a saltar
+                else:
+                    entra.tempo_manual = False
+                    self._auto_sync(entra)
+                    self._alinear_ya(entra)
+                    partes.append(f"Deck {entra.name} emparejado con {'A' if entra is b else 'B'} (tempo y compases)")
             else:
                 partes.append("el emparejamiento se hace al darle play a los dos")
         else:
