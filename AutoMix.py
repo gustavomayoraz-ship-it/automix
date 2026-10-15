@@ -495,7 +495,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QAbstractItemView, QSpinBox, QDialog, QCheckBox, QSizePolicy,
     QLayout, QScrollBar, QAbstractScrollArea, QProgressBar, QGridLayout, QGraphicsDropShadowEffect
 )
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, QPointF, QMimeData, QUrl, QSize, QRectF, QPoint, QEvent
+from PySide6.QtCore import QAbstractNativeEventFilter, QCoreApplication, Qt, QTimer, QThread, Signal, QPointF, QMimeData, QUrl, QSize, QRectF, QPoint, QEvent
 from PySide6.QtGui import (
     QGuiApplication, QDragEnterEvent, QDropEvent, QColor, QPen, QPainter, QBrush,
     QPolygonF, QFont, QCursor, QKeyEvent, QShortcut, QKeySequence,
@@ -4296,6 +4296,53 @@ class SmartSync:
 # =====================================================================
 # 6) VENTANA PRINCIPAL
 # =====================================================================
+class TeclaGlobalF2(QAbstractNativeEventFilter):
+    """Tecla F2 "global" en Windows (RegisterHotKey): funciona aunque el reproductor esté en segundo plano."""
+    ID = 0xA7F2
+    WM_HOTKEY = 0x0312
+    VK_F2 = 0x71
+
+    def __init__(self, accion):
+        super().__init__()
+        self.accion = accion
+        self.activa = False
+
+    def registrar(self):
+        if sys.platform != "win32" or self.activa:
+            return self.activa
+        try:
+            import ctypes
+            if ctypes.windll.user32.RegisterHotKey(None, self.ID, 0x4000, self.VK_F2):   # 0x4000 = sin repetir al mantenerla
+                QCoreApplication.instance().installNativeEventFilter(self)
+                self.activa = True
+        except Exception:
+            self.activa = False
+        return self.activa
+
+    def quitar(self):
+        if not self.activa:
+            return
+        try:
+            import ctypes
+            ctypes.windll.user32.UnregisterHotKey(None, self.ID)
+            QCoreApplication.instance().removeNativeEventFilter(self)
+        except Exception:
+            pass
+        self.activa = False
+
+    def nativeEventFilter(self, event_type, message):
+        try:
+            if bytes(event_type) in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
+                import ctypes
+                from ctypes import wintypes
+                msg = wintypes.MSG.from_address(int(message))
+                if msg.message == self.WM_HOTKEY and msg.wParam == self.ID:
+                    QTimer.singleShot(0, self.accion)
+        except Exception:
+            pass
+        return False, 0
+
+
 class AutoMix(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -4767,6 +4814,17 @@ class AutoMix(QMainWindow):
         col_mix.addSpacing(34)                    # salta la fila "Rejilla A" (30 px + 4 de separación)
         self.btn_mix.setMinimumWidth(230)
         col_mix.addWidget(self.btn_mix)
+        self.chk_f2g = QCheckBox("⌨ F2 funciona con el programa en segundo plano")
+        self.chk_f2g.setToolTip("Con esto activado, F2 mezcla aunque estés en otra ventana o programa (mientras AutoMix esté abierto).\n"
+                                "Mientras esté activado, F2 no llega a los otros programas (por ejemplo, renombrar en el Explorador).")
+        self.chk_f2g.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.f2_global = TeclaGlobalF2(self._mix_clicked)
+        if sys.platform != "win32":
+            self.chk_f2g.setVisible(False)
+        self.chk_f2g.setChecked(bool(leer_config().get("f2_global", True)))
+        self.chk_f2g.toggled.connect(self._f2_global_cambio)
+        col_mix.addWidget(self.chk_f2g)
+        self._f2_global_cambio(self.chk_f2g.isChecked(), guardar=False)
         col_mix.addStretch(1)
         self._fila_herr.addLayout(col_mix)
         self.spin_mix.setFixedWidth(58)           # corto: solo el número
@@ -6110,6 +6168,17 @@ class AutoMix(QMainWindow):
             self._set_status("🔗 Sync suelto: velocidad normal")
 
     # ================= MEZCLA CON PAUSA AL 50% =================
+    def _f2_global_cambio(self, activo, guardar=True):
+        if activo:
+            if not self.f2_global.registrar() and sys.platform == "win32":
+                try: self._set_status("⚠️ F2 ya lo usa otro programa: solo funciona con AutoMix en primer plano")
+                except Exception: print("[F2] otro programa ya usa F2: solo funciona con AutoMix en primer plano")
+        else:
+            self.f2_global.quitar()
+        if guardar:
+            try: guardar_config(f2_global=bool(activo))
+            except Exception: pass
+
     def _mix_clicked(self):
         if self.mix_pausa_timer.isActive():          # en la pausa del 50 %: seguir ya, sin invertir el sentido
             self.mix_pausa_timer.stop()
@@ -6385,6 +6454,8 @@ class AutoMix(QMainWindow):
 
     def closeEvent(self, event):
         log("programa", "cerrando AutoMix")
+        try: self.f2_global.quitar()
+        except Exception: pass
         try:
             if self.mixer.grabador.activo:
                 self._parar_grabacion()          # que el .wav quede completo
