@@ -93,6 +93,8 @@ def asegurar_dependencias():
             return
     except Exception:
         pass
+    if all(_modulo_en_offline(m) for m, _pq in DEPENDENCIAS):      # todo instalado: ni abrir la ventana (ahorra ~1 s)
+        return
     try:
         import tkinter as tk
         from tkinter import ttk, messagebox
@@ -1533,6 +1535,17 @@ class EtiquetaTema(EtiquetaElidida):
         super().mousePressEvent(e)
 
 
+def qss_marco(selector, color, titulo=True):
+    """Estilo de un cuadro (QGroupBox o QFrame) con el mismo degradé de color que los decks: el tono del cuadro es el de su acento."""
+    c = QColor(color); h = max(0, c.hue())
+    f1 = QColor.fromHsv(h, 185, 84).name(); f2 = QColor.fromHsv(h, 170, 40).name(); f3 = QColor.fromHsv(h, 150, 17).name()
+    q = (f"{selector} {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 {f1}, stop:0.55 {f2}, stop:1 {f3});"
+         f" border:1px solid {_rgba(color, 120)}; border-radius:12px;" + (" margin-top:12px; padding-top:6px;" if titulo else "") + " }")
+    if titulo:
+        q += f" {selector}::title {{ subcontrol-origin:margin; subcontrol-position:top left; left:14px; padding:0 8px; color:{color}; font-weight:bold; }}"
+    return q
+
+
 class WsolaFlujo:
     """Time-stretch en tiempo real por WSOLA (Waveform Similarity Overlap-Add): cambia la velocidad SIN cambiar el tono.
     Cada trama (N muestras, ventana de Hann, solape del 50 %) se toma del tema cerca de su posición nominal
@@ -1724,10 +1737,11 @@ class Deck(QFrame):
     @staticmethod
     def _qss_deck(color):
         c = QColor(color); h = max(0, c.hue())
-        f1 = QColor.fromHsv(h, 200, 70).name(); f2 = QColor.fromHsv(h, 180, 28).name()
+        f1 = QColor.fromHsv(h, 210, 104).name(); f2 = QColor.fromHsv(h, 190, 48).name()
+        f3 = QColor.fromHsv(h, 165, 19).name()
         osc = QColor.fromHsv(h, 230, 150).name()
         return (
-            f"Deck {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 {f1}, stop:0.55 {f2}, stop:1 #070a12);"
+            f"Deck {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 {f1}, stop:0.55 {f2}, stop:1 {f3});"
             f" border:1px dashed {_rgba(color, 150)}; border-radius:14px; }}"
             f"Deck[cargado=\"true\"] {{ border:1px solid {_rgba(color, 230)}; }}"
             f"Deck QSlider::sub-page:horizontal {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 {osc}, stop:1 {color}); border-radius:4px; }}"
@@ -3068,6 +3082,7 @@ class PanelCruce(QFrame):
         super().__init__()
         self.v = ventana
         self.setObjectName("panelcruce")
+        self.setStyleSheet(qss_marco("QFrame#panelcruce", "#3b82f6", titulo=False))
         self.setMinimumWidth(230); self.setMaximumWidth(300)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 8, 8, 8)
@@ -3324,6 +3339,7 @@ class _DelegadoFondo(QStyledItemDelegate):
 
 
 class Biblioteca(QListWidget):
+    aviso = Signal(str)        # mensaje para la barra de estado (p. ej. duplicados omitidos)
     cambio = Signal()
     nuevos = Signal()          # se agregaron temas: hay que analizarlos
     ROL_NOMBRE = Qt.ItemDataRole.UserRole + 1
@@ -3349,6 +3365,22 @@ class Biblioteca(QListWidget):
     @staticmethod
     def _clave(p):
         return os.path.normcase(os.path.abspath(p))
+
+    @staticmethod
+    def _firma(p):
+        """Identidad de un tema para detectar duplicados aunque estén en otra carpeta o se llamen "Tema (1)" / "Tema - copia":
+        (nombre normalizado, tamaño del archivo). Dos archivos con el mismo nombre y el mismo tamaño son el mismo tema."""
+        base = os.path.splitext(os.path.basename(p))[0].lower()
+        nombre = re.sub(r"^\s*(copia|copy)\s+de\s+", "", base)                                   # "Copia de tema"
+        for _ in range(3):                                                                       # "tema - copia (2)", "tema (1)"…
+            nombre = re.sub(r"[\s_]*[\(\[]\s*\d+\s*[\)\]]\s*$", "", nombre)
+            nombre = re.sub(r"[\s_\-]+[\(\[]?\s*(copia|copy|copie|kopie)\s*\d*\s*[\)\]]?\s*$", "", nombre)
+        nombre = re.sub(r"[\s_]+", " ", nombre).strip() or base
+        try:
+            tam = os.path.getsize(p)
+        except OSError:
+            tam = -1
+        return (nombre, tam)
 
     def _nombre(self, it):
         n = it.data(self.ROL_NOMBRE)
@@ -3463,14 +3495,25 @@ class Biblioteca(QListWidget):
             if getattr(self, "_ult_pintado", None):
                 self.pintar(*self._ult_pintado)
 
+    def _firmas_actuales(self):
+        return {self._firma(self.item(i).data(Qt.ItemDataRole.UserRole)) for i in range(self.count())}
+
     def agregar(self, rutas):
         n = 0
+        dup = 0
+        firmas = self._firmas_actuales()               # lo que ya está en la lista (por nombre + tamaño)
         self.setUpdatesEnabled(False)
         try:
             for p in _escanear(rutas):
                 clave = os.path.normcase(os.path.abspath(p))
                 if clave in self._rutas:
+                    continue                           # el mismo archivo, ya está
+                f = self._firma(p)
+                if f in firmas:
+                    dup += 1                           # una copia de un tema que ya está (otra carpeta, "(1)", "- copia"…)
+                    log("biblioteca", f"duplicado omitido: {os.path.basename(p)}")
                     continue
+                firmas.add(f)
                 self._rutas.add(clave)
                 nombre = os.path.splitext(os.path.basename(p))[0]
                 it = QListWidgetItem(nombre)
@@ -3486,6 +3529,8 @@ class Biblioteca(QListWidget):
             self._refrescar_textos()
             self.cambio.emit()
             self.nuevos.emit()
+        if dup:
+            self.aviso.emit(f"♻️ {dup} tema(s) repetido(s) no se agregaron" + (f" · {n} nuevo(s)" if n else ""))
         return n
 
     def quitar_seleccion(self):
@@ -4069,6 +4114,7 @@ class AutoMix(QMainWindow):
         self.ed_filtro.setClearButtonEnabled(True)
         lib_lay.addWidget(self.ed_filtro)
         self.biblioteca = Biblioteca()
+        self.biblioteca.setStyleSheet(qss_marco("QListWidget", "#2bb5d6", titulo=False))     # el fondo de la lista, con el mismo degradé de color
         lib_lay.addWidget(self.biblioteca, stretch=1)
         lib_btns = QHBoxLayout()
         b_limpiar = QPushButton("Vaciar"); b_limpiar.clicked.connect(self.biblioteca.limpiar)
@@ -4094,6 +4140,7 @@ class AutoMix(QMainWindow):
         lib_lay.addWidget(EtiquetaElidida("Arrastrá un tema a Deck A o B"))
         self.ed_filtro.textChanged.connect(self._filtrar_biblioteca)
         self.biblioteca.cambio.connect(self._biblioteca_cambio)
+        self.biblioteca.aviso.connect(self._set_status)
         self.biblioteca.itemDoubleClicked.connect(self._biblioteca_doble_clic)
         split.addWidget(panel_lib)
 
@@ -4219,6 +4266,7 @@ class AutoMix(QMainWindow):
 
         barra_box = QGroupBox("⚓ Auto-enganche — progreso del tema sonando")
         barra_box.setFixedHeight(84)
+        barra_box.setStyleSheet(qss_marco("QGroupBox", TEMA["ambar"]))
         bl = QHBoxLayout(barra_box)
         bl.setContentsMargins(8, 6, 8, 4)
         bl.setSpacing(8)
@@ -4247,6 +4295,7 @@ class AutoMix(QMainWindow):
         root.addLayout(zoom_row)
 
         tl_box = QGroupBox("🎼 Timeline — Playhead FIJO al centro")
+        tl_box.setStyleSheet(qss_marco("QGroupBox", TEMA["verde"]))
         tl_lay = QVBoxLayout(tl_box)
         tl_lay.setContentsMargins(4, 4, 4, 4)
         self.timeline = UnifiedTimeline(self.deck_a, self.deck_b, on_manito_cb=self._on_manito_release)
@@ -4321,6 +4370,7 @@ class AutoMix(QMainWindow):
     def _crear_panel_multibanda(self):
         cfg = leer_config()
         w = QGroupBox("🎛️ Multibanda Automática y Ecualizador Inteligente")
+        w.setStyleSheet(qss_marco("QGroupBox", TEMA["violeta"]))
         g = QGridLayout(w)
         g.setContentsMargins(8, 6, 8, 4)
         g.setVerticalSpacing(3)
