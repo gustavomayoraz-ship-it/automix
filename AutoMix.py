@@ -499,7 +499,7 @@ from PySide6.QtCore import Qt, QTimer, QThread, Signal, QPointF, QMimeData, QUrl
 from PySide6.QtGui import (
     QGuiApplication, QDragEnterEvent, QDropEvent, QColor, QPen, QPainter, QBrush,
     QPolygonF, QFont, QCursor, QKeyEvent, QShortcut, QKeySequence,
-    QLinearGradient, QRadialGradient, QPainterPath, QFontMetricsF
+    QLinearGradient, QRadialGradient, QPainterPath, QFontMetricsF, QDesktopServices
 )
 
 
@@ -825,6 +825,49 @@ def _grilla_final(res, linea):
     if abs(bpm_n - float(res["bpm"])) / float(res["bpm"]) < 0.03:
         res["bpm"] = float(bpm_n)
     res["grid"] = 1
+
+
+def grilla_manual(res, factor=1.0, uno_en=None):
+    """Corrección a mano de la grilla de un tema (modifica `res`).
+    factor 2 / 0.5 = BPM doble / mitad (se conserva la fase) · uno_en = segundo donde cae el "1" de un compás."""
+    bpm0 = float(res["bpm"])
+    bt0 = np.asarray(res.get("beats_full") or [], dtype=np.float64)
+    if len(bt0) >= 2:
+        slope = float(np.median(np.diff(bt0)))
+        icpt = float(bt0[0])
+    else:
+        slope = 60.0 / bpm0
+        icpt = 0.0
+    if factor and factor != 1.0:
+        slope = slope / float(factor)
+    if uno_en is not None:
+        icpt = float(uno_en)                    # este golpe pasa a ser un "1": la grilla se re-ancla acá
+        modo_fijo = 0
+    else:
+        modo_fijo = None
+    dur = float(res["duration"])
+    if modo_fijo is not None:
+        j0 = int(np.ceil((0.0 - icpt) / slope)); j1 = int(np.floor((dur - icpt) / slope))
+        jj = np.arange(j0, j1 + 1)
+        bt = icpt + slope * jj
+        db = bt[(jj % 4) == 0]
+    else:
+        d_old = np.asarray(res.get("downbeats_full") or [], dtype=np.float64)
+        ref = float(d_old[0]) if len(d_old) else icpt                 # se mantiene dónde estaba un "1"
+        j0 = int(np.ceil((0.0 - icpt) / slope)); j1 = int(np.floor((dur - icpt) / slope))
+        jj = np.arange(j0, j1 + 1)
+        bt = icpt + slope * jj
+        k_ref = int(np.round((ref - icpt) / slope))
+        db = bt[((jj - k_ref) % 4) == 0]
+    def _ralo(v, tope):
+        v = list(map(float, v))
+        return v if len(v) <= tope else v[::len(v) // tope + 1]
+    res["beats_full"] = list(map(float, bt)); res["beats"] = _ralo(bt, 400)
+    res["downbeats_full"] = list(map(float, db)); res["downbeats"] = _ralo(db, 200)
+    res["bpm"] = float(60.0 / slope)
+    res["grid"] = 1
+    res["manual"] = True
+    return res
 
 
 def _limpiar_grilla_cache(res):
@@ -1899,6 +1942,27 @@ class Deck(QFrame):
         if self.on_analysis_cb:
             self.on_analysis_cb(self.name, res)
 
+    def corregir_rejilla(self, factor=1.0, uno_en=None):
+        """Botones ÷2 / ×2 / ①. Cambia la grilla del tema cargado, la guarda en su caché y avisa a la ventana."""
+        if not self.analysis or not self.path:
+            return False
+        try:
+            with self.lock:
+                grilla_manual(self.analysis, factor, uno_en)
+                self.original_bpm = self.analysis["bpm"]
+                self._db_cache = None
+            self._update_bpm_label()
+            try:
+                _guardar_cache(CACHE_DIR / (Path(self.path).stem + ".json"), self.analysis)
+            except Exception:
+                import traceback; traceback.print_exc()
+            if self.on_analysis_cb:
+                self.on_analysis_cb(self.name, self.analysis)
+            return True
+        except Exception:
+            import traceback; traceback.print_exc()
+            return False
+
     def _update_bpm_label(self):
         if self.original_bpm is None:
             return
@@ -2712,6 +2776,68 @@ class LimitadorSuave:
         return x * gm[:, None]
 
 
+class GrabadorMezcla:
+    """Graba a un .wav (16 bits) exactamente lo que sale por los parlantes. El callback de audio solo encola una copia;
+    un hilo aparte escribe en disco, así que grabar no puede producir cortes en el sonido."""
+    def __init__(self, sr=44100):
+        import queue
+        self.sr = sr
+        self.activo = False
+        self.ruta = None
+        self.muestras = 0
+        self.perdidos = 0
+        self._q = queue.Queue(maxsize=600)         # ~14 s de margen si el disco se atrasa
+        self._hilo = None
+        self._error = None
+
+    def iniciar(self, carpeta):
+        carpeta = Path(carpeta); carpeta.mkdir(parents=True, exist_ok=True)
+        self.ruta = carpeta / time.strftime("AutoMix_%Y-%m-%d_%H-%M-%S.wav")
+        self.muestras = 0; self.perdidos = 0; self._error = None
+        while not self._q.empty():
+            try: self._q.get_nowait()
+            except Exception: break
+        archivo = sf.SoundFile(str(self.ruta), mode="w", samplerate=self.sr, channels=2, subtype="PCM_16")
+        self._hilo = threading.Thread(target=self._escribir, args=(archivo,), daemon=True)
+        self.activo = True
+        self._hilo.start()
+        return self.ruta
+
+    def escribir(self, bloque):               # lo llama el callback de audio: rápido y sin bloquear
+        try:
+            self._q.put_nowait(np.array(bloque, dtype=np.float32, copy=True))
+            self.muestras += len(bloque)
+        except Exception:
+            self.perdidos += len(bloque)
+
+    def _escribir(self, archivo):
+        try:
+            while True:
+                b = self._q.get()
+                if b is None:
+                    break
+                archivo.write(b)
+        except Exception as e:
+            self._error = str(e)
+            self.activo = False
+        finally:
+            try: archivo.close()
+            except Exception: pass
+
+    def detener(self):
+        """Corta la grabación y espera a que el disco termine. Devuelve (ruta, segundos)."""
+        self.activo = False
+        if self._hilo is not None:
+            self._q.put(None)
+            self._hilo.join(timeout=10)
+            self._hilo = None
+        return self.ruta, self.muestras / float(self.sr)
+
+    @property
+    def segundos(self):
+        return self.muestras / float(self.sr)
+
+
 class GlobalMixer:
     F_CRUCE = 150.0           # por debajo = "graves" (bombo y bajo)
     ESPERA_COMPAS_S = 2.5     # (respaldo) espera máxima de la línea de compás si no se conoce el BPM
@@ -2742,6 +2868,7 @@ class GlobalMixer:
         self._e = [0.0, 0.0, 0.0]          # energías suavizadas: deck A, deck B y la suma
         self.comp_db = 0.0
         self.vu = (0.0, 0.0, 1.0, 1.0)     # picos L, R (a la salida), ganancia del limitador y del compensador
+        self.grabador = GrabadorMezcla(sr)
 
     @staticmethod
     def _rampa(g0, g1, frames):
@@ -2930,6 +3057,8 @@ class GlobalMixer:
         except Exception:
             pass
         outdata[:] = mix.astype(np.float32)
+        if self.grabador.activo:
+            self.grabador.escribir(outdata)
 
 
 # =====================================================================
@@ -4173,6 +4302,10 @@ class AutoMix(QMainWindow):
         izq.addStretch(1)                        # la duración queda centrada en el hueco entre los decks y el panel de abajo
         self._fila_duracion = QHBoxLayout(); self._fila_duracion.setContentsMargins(0, 0, 0, 0); self._fila_duracion.setSpacing(6)
         izq.addLayout(self._fila_duracion)       # a la altura del botón "Valores por defecto", justo debajo de los dos decks
+        self._fila_grab = QHBoxLayout(); self._fila_grab.setContentsMargins(0, 0, 0, 0); self._fila_grab.setSpacing(6)
+        izq.addLayout(self._fila_grab)           # herramientas: grabación de la mezcla (y las que vengan)
+        self._fila_rej = QHBoxLayout(); self._fila_rej.setContentsMargins(0, 0, 0, 0); self._fila_rej.setSpacing(4)
+        izq.addLayout(self._fila_rej)            # rejilla de BPM / compases de cada deck
         izq.addStretch(1)
         decks_row.addLayout(izq, stretch=1)
         decks_row.addWidget(self.panel_cruce, alignment=Qt.AlignmentFlag.AlignTop)
@@ -4256,6 +4389,34 @@ class AutoMix(QMainWindow):
         if not CONSOLA.es_windows:
             self.btn_consola.setVisible(False)
         self._f_dur.insertWidget(self._f_dur.count() - 1, self.btn_consola)   # al costado de Duración, mismo tamaño
+        self.btn_grabar = QPushButton("⏺ Grabar mezcla")
+        self.btn_grabar.setFixedHeight(40)
+        self.btn_grabar.setMinimumWidth(190)
+        self.btn_grabar.setToolTip("Graba en un .wav todo lo que suena (la mezcla completa, con ecualizador y limitador)")
+        self.btn_grabar.clicked.connect(self._alternar_grabacion)
+        self.btn_carpeta_grab = QPushButton("📂")
+        self.btn_carpeta_grab.setFixedSize(52, 40)
+        self.btn_carpeta_grab.setToolTip("Abrir la carpeta con las mezclas grabadas")
+        self.btn_carpeta_grab.clicked.connect(self._abrir_carpeta_grabaciones)
+        self.lbl_grab = QLabel("")
+        self._fila_grab.addWidget(self.btn_grabar)
+        self._fila_grab.addWidget(self.btn_carpeta_grab)
+        self._fila_grab.addWidget(self.lbl_grab, 1)
+        self._t_grab = QTimer(self); self._t_grab.setInterval(250)
+        self._t_grab.timeout.connect(self._tic_grabacion)
+        for deck, col in ((self.deck_a, COLOR_DECK_A), (self.deck_b, COLOR_DECK_B)):
+            self._fila_rej.addWidget(QLabel(f"<b style='color:{col}'>Rejilla {deck.name}</b>"))
+            for txt, tip, fn in (
+                ("÷2", "BPM a la mitad (si el análisis detectó el doble)", lambda _=False, d=deck: self._rejilla(d, factor=0.5)),
+                ("×2", "BPM al doble (si el análisis detectó la mitad)", lambda _=False, d=deck: self._rejilla(d, factor=2.0)),
+                ("①", "Poner el \"1\" del compás en la posición actual (pausá el tema justo en el golpe fuerte con la manito)", lambda _=False, d=deck: self._rejilla(d, uno=True)),
+            ):
+                b = QPushButton(txt); b.setFixedSize(44, 34); b.setToolTip(tip)
+                b.setStyleSheet("QPushButton { padding:0px; font-size:16px; font-weight:bold; }")
+                b.clicked.connect(fn)
+                self._fila_rej.addWidget(b)
+            self._fila_rej.addSpacing(14)
+        self._fila_rej.addStretch(1)
         self.btn_esquina = QPushButton("↖")
         self.btn_esquina.setFixedSize(76, 52)
         self.btn_esquina.setStyleSheet("QPushButton { font-size:34px; padding:0px; }")
@@ -5065,6 +5226,75 @@ class AutoMix(QMainWindow):
         self.resize(self.minimumSizeHint())
         self._escalar_segun_ventana()
         self._ajustar_a_pantalla()
+
+    CARPETA_GRAB = Path(__file__).parent / "grabaciones"
+
+    def _alternar_grabacion(self):
+        g = self.mixer.grabador
+        if not g.activo:
+            try:
+                ruta = g.iniciar(self.CARPETA_GRAB)
+            except Exception as e:
+                log("grabación", f"no se pudo iniciar ({e})")
+                self._set_status(f"⚠️ No se pudo grabar: {e}")
+                return
+            log("grabación", f"grabando en {ruta}")
+            self.btn_grabar.setStyleSheet("QPushButton { background:#7a1620; border:2px solid #ff4d5e; color:#ffffff; font-weight:bold; }")
+            self._tic_grabacion()
+            self._t_grab.start()
+        else:
+            self._parar_grabacion()
+
+    def _parar_grabacion(self):
+        g = self.mixer.grabador
+        self._t_grab.stop()
+        ruta, seg = g.detener()
+        self.btn_grabar.setStyleSheet("")
+        self.btn_grabar.setText("⏺ Grabar mezcla")
+        if ruta and seg > 0:
+            m, s = divmod(int(seg), 60)
+            self.lbl_grab.setText(f"✅ {Path(ruta).name} ({m}:{s:02d})")
+            log("grabación", f"guardada {ruta} ({seg:.1f} s)" + (f" · {g.perdidos} muestras perdidas" if g.perdidos else ""))
+            self._set_status(f"✅ Mezcla guardada en grabaciones/{Path(ruta).name}")
+        else:
+            self.lbl_grab.setText("")
+
+    def _tic_grabacion(self):
+        g = self.mixer.grabador
+        if g._error:
+            self._parar_grabacion()
+            self.lbl_grab.setText("⚠️ Error de disco")
+            return
+        seg = int(g.segundos)
+        h, r = divmod(seg, 3600); m, s = divmod(r, 60)
+        t = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+        self.btn_grabar.setText(("⏹ " if seg % 2 == 0 else "⏺ ") + f"Grabando  {t}")
+        self.lbl_grab.setText("")
+
+    def _abrir_carpeta_grabaciones(self):
+        try:
+            self.CARPETA_GRAB.mkdir(parents=True, exist_ok=True)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.CARPETA_GRAB)))
+        except Exception as e:
+            log("grabación", f"no se pudo abrir la carpeta ({e})")
+
+    def _rejilla(self, deck, factor=1.0, uno=False):
+        if not deck.analysis:
+            self._set_status(f"⚠️ Deck {deck.name}: no hay un tema analizado")
+            return
+        t_uno = None
+        if uno:
+            t_uno = (deck.cursor + deck._cursor_frac) / float(deck.sr)
+            try:                                  # sonando: lo que se oye va atrás de la posición por la latencia de la salida
+                if deck.playing and self.mixer.stream is not None:
+                    t_uno -= float(self.mixer.stream.latency) * max(1e-6, deck.rate_eff)
+            except Exception:
+                pass
+            t_uno = max(0.0, t_uno)
+        if deck.corregir_rejilla(factor=factor, uno_en=t_uno):
+            msg = ("BPM ×2" if factor == 2.0 else "BPM ÷2") if not uno else f"el 1 queda en {fmt_time(t_uno)}"
+            log(f"deck {deck.name}", f"rejilla: {msg} → {deck.analysis['bpm']:.2f} BPM")
+            self._set_status(f"🎯 Deck {deck.name}: {msg} · {deck.analysis['bpm']:.1f} BPM (guardado)")
 
     def _a_la_esquina(self):
         """Botón ↖: la ventana vuelve al tamaño mínimo de arranque y queda pegada a la esquina superior izquierda.
@@ -5899,6 +6129,11 @@ class AutoMix(QMainWindow):
 
     def closeEvent(self, event):
         log("programa", "cerrando AutoMix")
+        try:
+            if self.mixer.grabador.activo:
+                self._parar_grabacion()          # que el .wav quede completo
+        except Exception:
+            pass
         try:
             guardar_config(decks_cargados={"A": self.deck_a.path, "B": self.deck_b.path})     # al abrir vuelven a quedar cargados
         except Exception:
