@@ -43,6 +43,9 @@ DEF_GOLPE = 4         # golpe 43 Hz (%)
 DEF_MEDIOS = -20      # medios (décimas de dB: -20 = -2,0 dB)
 DEF_AGUDOS = 50       # agudos (décimas de dB: 50 = +5,0 dB)
 DEF_VOLUMEN = 50      # volumen general (%)
+DEF_MAN_UMBRAL = (-18, -16, -14)   # ajustes de la multibanda (graves, medios, agudos): umbral (dB)
+DEF_MAN_RATIO = (20, 20, 20)       # ratio en décimas (20 = 2,0:1)
+DEF_MAN_COMP = (0, 0, 0)           # compensación en décimas de dB
 DEF_ZOOM = 15         # zoom de la línea de tiempo (px/s)
 
 
