@@ -41,7 +41,7 @@ DEF_MB_LIM = 6        # máx. corrección (dB)
 DEF_MB_VEL = 20       # velocidad (décimas de dB/s: 20 = 2,0 dB/s)
 DEF_GOLPE = 4         # golpe 43 Hz (%)
 DEF_MEDIOS = -20      # medios (décimas de dB: -20 = -2,0 dB)
-DEF_AGUDOS = -50      # agudos (décimas de dB: -50 = -5,0 dB)
+DEF_AGUDOS = 50       # agudos (décimas de dB: 50 = +5,0 dB)
 DEF_VOLUMEN = 50      # volumen general (%)
 DEF_ZOOM = 15         # zoom de la línea de tiempo (px/s)
 
