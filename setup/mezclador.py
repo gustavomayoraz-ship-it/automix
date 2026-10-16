@@ -106,6 +106,8 @@ class GlobalMixer:
         self.vu = (0.0, 0.0, 1.0, 1.0)     # picos L, R (a la salida), ganancia del limitador y del compensador
         self.grabador = GrabadorMezcla(sr)
         self.aur = Auriculares(sr, blocksize)      # salida de auriculares (PFL)
+        self.cortes_audio = 0              # veces que la placa pidió audio y no llegó a tiempo
+        self.cb_max_ms = 0.0               # lo más que tardó un bloque desde el último aviso
 
     @staticmethod
     def _rampa(g0, g1, frames):
@@ -268,6 +270,9 @@ class GlobalMixer:
             self.stream.stop(); self.stream.close(); self.stream = None
 
     def _cb(self, outdata, frames, time_info, status):
+        if status and getattr(status, "output_underflow", False):
+            self.cortes_audio += 1                      # la salida se quedó sin audio a tiempo (se oye como trancada)
+        t_cb0 = time.perf_counter()
         pa = self.deck_a.cursor + self.deck_a._cursor_frac + self.deck_a.loop_desfase          # posición al INICIO del bloque (para caer en el compás)
         pb = self.deck_b.cursor + self.deck_b._cursor_frac + self.deck_b.loop_desfase
         a = self.deck_a.render(frames)
@@ -330,5 +335,8 @@ class GlobalMixer:
         except Exception:
             pass
         outdata[:] = mix.astype(np.float32)
+        dt_cb = (time.perf_counter() - t_cb0) * 1000.0
+        if dt_cb > self.cb_max_ms:
+            self.cb_max_ms = dt_cb
         if self.grabador.activo:
             self.grabador.escribir(outdata)

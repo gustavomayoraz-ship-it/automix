@@ -483,6 +483,7 @@ def _mensajes_qt(tipo, ctx, msg):
 
 def main(tiempos=None):
     t_ini = time.perf_counter()
+    sys.setswitchinterval(0.0005)        # el hilo del audio no espera 5 ms a que la pantalla suelte Python (menos trancadas)
     app = QApplication(sys.argv)
     try:
         from PySide6.QtCore import qInstallMessageHandler, __version__ as _qv

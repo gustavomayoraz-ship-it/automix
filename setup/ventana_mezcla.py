@@ -230,9 +230,24 @@ class MezclaMixin:
 
         self._ultimo_prog_primario = prog
 
+    def _vigilar_cortes_audio(self):
+        """Avisa en la consola cuando la salida principal se queda sin audio (trancada) o un bloque tarda demasiado."""
+        m = self.mixer
+        n = m.cortes_audio
+        if n != getattr(self, "_cortes_vistos", 0):
+            log("audio", f"⚠ corte de audio en la salida principal (van {n}) · bloque más lento: {m.cb_max_ms:.0f} ms"
+                         f" (el límite es {m.blocksize / m.sr * 1000:.0f} ms)")
+            self._cortes_vistos = n
+            m.cb_max_ms = 0.0
+        elif m.cb_max_ms > 0.8 * m.blocksize / m.sr * 1000 and time.monotonic() - getattr(self, "_t_lento", 0) > 5:
+            log("audio", f"un bloque de audio tardó {m.cb_max_ms:.0f} ms (el límite es {m.blocksize / m.sr * 1000:.0f} ms): casi se corta")
+            self._t_lento = time.monotonic()
+            m.cb_max_ms = 0.0
+
     def _tick(self):
         self.deck_a.tick()
         self.deck_b.tick()
+        self._vigilar_cortes_audio()
         self._mb_actualizar_barras()
         try:
             self._animar_cruce()

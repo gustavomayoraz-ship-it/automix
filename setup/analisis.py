@@ -384,7 +384,10 @@ def grilla_manual(res, factor=1.0, uno_en=None):
         slope = 60.0 / bpm0
         icpt = float(d0[0]) if len(d0) else 0.0
     if factor and factor != 1.0:
+        base = float(res.setdefault("bpm_base", bpm0))             # el BPM que detectó el análisis (antes de ×2 / ÷2)
         slope = slope / float(factor)
+        if not (base / 2.0 - 0.5 <= 60.0 / slope <= base * 2.0 + 0.5):
+            raise ValueError(f"ya está en el límite: se detectó {base:.0f} BPM y solo se puede ir de {base / 2:.0f} a {base * 2:.0f}")
     if not (BPM_CORREGIDO_MIN <= 60.0 / slope <= BPM_CORREGIDO_MAX):
         raise ValueError(f"{60.0 / slope:.0f} BPM queda fuera del rango razonable ({BPM_CORREGIDO_MIN:.0f}-{BPM_CORREGIDO_MAX:.0f})")
     if uno_en is not None:

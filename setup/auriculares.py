@@ -19,8 +19,9 @@ class Auriculares:
     """Segunda salida de audio (por ejemplo un DAC USB). Recibe, bloque a bloque, el audio de los decks marcados
     (antes del crossfader, por eso se oye aunque a los parlantes no llegue nada) y lo reproduce por su propio dispositivo.
     Como son dos placas con relojes distintos, entre las dos hay una pequeña cola de amortiguación."""
-    PREVIO = 3            # bloques que se juntan antes de empezar a sonar (evita cortes por llegar justo)
-    MAX_BLOQUES = 8       # si se acumulan más, se descartan los más viejos (los relojes de las placas no son idénticos)
+    PREVIO_MIN = 4        # bloques que se juntan antes de empezar a sonar (evita cortes por llegar justo)
+    PREVIO_MAX = 14       # si se cortan seguido (Bluetooth entrega a ráfagas), el colchón crece solo hasta acá
+    MAX_EXTRA = 6         # cuántos bloques de más se aguantan antes de descartar los más viejos (relojes de placas distintas)
 
     def __init__(self, sr, bloque=1024):
         self.sr = sr
@@ -29,6 +30,9 @@ class Auriculares:
         self.nombre = ""             # dispositivo abierto
         self.error = ""
         self.canales = 2
+        self.PREVIO = self.PREVIO_MIN
+        self.MAX_BLOQUES = self.PREVIO + self.MAX_EXTRA
+        self.cortes = 0              # cuántas veces se vació la cola (para agrandar el colchón)
         self.GANANCIA = 3.5          # refuerzo propio de los auriculares (+11 dB): la salida principal queda igual
         self.vol = 0.8               # 0..1 (se aplica al cuadrado, como el volumen general)
         self.cue_a = False
@@ -78,6 +82,7 @@ class Auriculares:
 
     def abrir(self, indice, nombre="", canales=2, api=""):
         self.cerrar()
+        self.PREVIO = self.PREVIO_MIN; self.MAX_BLOQUES = self.PREVIO + self.MAX_EXTRA; self.cortes = 0
         try:
             extra = None
             if "WASAPI" in api:
@@ -218,6 +223,10 @@ class Auriculares:
             if falta > 0:                      # se vació: vuelve a juntar el colchón
                 partes.append(np.zeros((falta, 2), dtype=np.float32))
                 self._sonando = False
+                self.cortes += 1
+                if self.PREVIO < self.PREVIO_MAX:          # se cortó: la próxima vez se junta un colchón más grande
+                    self.PREVIO += 2
+                    self.MAX_BLOQUES = self.PREVIO + self.MAX_EXTRA
         blk = np.concatenate(partes) if len(partes) > 1 else partes[0]
         if outdata.shape[1] == 1:                      # salida mono (Bluetooth en perfil de llamadas): mezcla L+R
             outdata[:, 0] = blk.mean(axis=1)
