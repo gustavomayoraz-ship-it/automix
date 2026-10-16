@@ -96,7 +96,13 @@ class AutoMix(MultibandaMixin, EfectosMixin, LoopMixin, AuricularesMixin, Automa
         self.btn_ordenar_tono.setToolTip("Ordena la lista por tonalidad (clave Camelot: 1A, 1B, 2A … 12B), y dentro de cada tono por BPM.\n"
                                          "Los temas sin tono analizado quedan al final. Con 🔃 Ordenar por BPM se vuelve al orden anterior.")
         self.btn_ordenar_tono.clicked.connect(self._ordenar_biblioteca_tono)
-        lib_lay.addWidget(self.btn_ordenar_tono)
+        self.btn_agrupar = QPushButton("📂 Por carpetas")
+        self.btn_agrupar.setCheckable(True)
+        self.btn_agrupar.setToolTip("Muestra la lista separada por carpetas: el nombre de la carpeta como título y debajo sus temas.\n"
+                                    "Clic en un título para cerrar o abrir esa carpeta. Volvé a tocar el botón para la lista plana.")
+        self.btn_agrupar.clicked.connect(self._alternar_agrupada)
+        fila_orden = QHBoxLayout(); fila_orden.addWidget(self.btn_ordenar_tono); fila_orden.addWidget(self.btn_agrupar)
+        lib_lay.addLayout(fila_orden)
         # 🎼 Armónico y 🥁 En frase se quitaron de la pantalla: quedan siempre apagados
         # (el siguiente tema es el que sigue en la lista, ordenada por BPM, y la mezcla automática arranca al llegar a la marca).
         self.chk_armonico = _OpcionApagada()
@@ -376,6 +382,8 @@ class AutoMix(MultibandaMixin, EfectosMixin, LoopMixin, AuricularesMixin, Automa
         self.manito_on = True
 
         self.biblioteca.cargar()
+        if leer_config().get("lib_agrupada", False):
+            self.btn_agrupar.setChecked(True); self.biblioteca.set_agrupado(True)
         self._update_cf()
         QTimer.singleShot(0, self._restaurar_decks)
 

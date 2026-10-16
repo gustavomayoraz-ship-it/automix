@@ -4,7 +4,8 @@ import json
 import os
 import re
 from PySide6.QtWidgets import QAbstractItemView, QListWidget, QListWidgetItem, QStyledItemDelegate
-from PySide6.QtGui import QBrush, QColor, QPainter
+from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter
+from PySide6.QtWidgets import QStyleOptionViewItem
 from PySide6.QtCore import QMimeData, QUrl, Qt, Signal
 from setup.ajustes import FUENTE_BOOST, SUPPORTED
 from setup.analisis import compat_armonica
@@ -46,9 +47,44 @@ class _DelegadoFondo(QStyledItemDelegate):
             painter.setPen(Qt.PenStyle.NoPen); painter.setBrush(br)
             painter.drawRoundedRect(option.rect.adjusted(1, 1, -1, -1), 5, 5)
             painter.restore()
+        der = index.data(Qt.ItemDataRole.UserRole + 3)           # texto a la derecha (duración; en los títulos "cantidad / duración total")
+        if der:
+            opt = QStyleOptionViewItem(option)
+            fm = QFontMetrics(opt.font)
+            w = fm.horizontalAdvance(der) + 12
+            opt.rect.setRight(opt.rect.right() - w)
+            super().paint(painter, opt, index)
+            painter.save()
+            fg = index.data(Qt.ItemDataRole.ForegroundRole)
+            painter.setPen(fg.color() if fg is not None and fg != QBrush() else option.palette.text().color())
+            painter.setFont(opt.font)
+            painter.drawText(option.rect.adjusted(0, 0, -8, 0), int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), der)
+            painter.restore()
+            return
         super().paint(painter, option, index)
 
 
+
+
+def _reagrupa(f):
+    """Los ordenamientos trabajan solo con temas: se sacan los encabezados de carpeta antes y se vuelven a poner después."""
+    def w(self, *a, **k):
+        if not self.agrupado:
+            return f(self, *a, **k)
+        sel = {self._clave(it.data(Qt.ItemDataRole.UserRole)) for it in self.selectedItems() if not self._es_cab(it)}
+        barra = self.verticalScrollBar().value()
+        self._quitar_cab()
+        try:
+            return f(self, *a, **k)
+        finally:
+            self._poner_cab()
+            for i in range(self.count()):
+                it = self.item(i)
+                if not self._es_cab(it) and self._clave(it.data(Qt.ItemDataRole.UserRole)) in sel:
+                    it.setSelected(True)
+            self.verticalScrollBar().setValue(barra)
+    w.__name__ = f.__name__
+    return w
 
 
 class Biblioteca(QListWidget):
@@ -56,6 +92,7 @@ class Biblioteca(QListWidget):
     cambio = Signal()
     nuevos = Signal()          # se agregaron temas: hay que analizarlos
     ROL_NOMBRE = Qt.ItemDataRole.UserRole + 1
+    ROL_CAB = Qt.ItemDataRole.UserRole + 2         # True en los encabezados de carpeta
 
     def __init__(self):
         super().__init__()
@@ -72,7 +109,11 @@ class Biblioteca(QListWidget):
         self._cola = set()         # temas esperando su análisis (se muestran con ⏳)
         self._memo = {}            # ruta -> (bpm, clave Camelot, nombre de la nota, hay_clave): se lee el .json una sola vez
         self._memo_frase = {}      # ruta -> True si el tema tiene grilla de compases firme (sirve para mezclar en frase)
+        self._memo_dur = {}        # ruta -> duración en segundos (del análisis)
         self._memo_voz = {}        # ruta -> True si el análisis ya trae las curvas de voz/bajo
+        self.agrupado = False      # vista por carpetas: un encabezado por carpeta y debajo sus temas
+        self._plegadas = set()     # carpetas cerradas (con clic en el encabezado)
+        self.itemClicked.connect(self._clic_cab)
         self._referencia = None    # clave Camelot del tema que suena: los compatibles se pintan de verde
 
     @staticmethod
@@ -95,6 +136,84 @@ class Biblioteca(QListWidget):
             tam = -1
         return (nombre, tam)
 
+    # ---------- vista por carpetas ----------
+    def _es_cab(self, it):
+        return bool(it.data(self.ROL_CAB))
+
+    @staticmethod
+    def _carpeta(ruta):
+        return os.path.normcase(os.path.dirname(os.path.abspath(ruta)))
+
+    def _quitar_cab(self):
+        for i in range(self.count() - 1, -1, -1):
+            if self._es_cab(self.item(i)):
+                self.takeItem(i)
+            else:
+                self.item(i).setHidden(False)
+
+    def _poner_cab(self):
+        """Agrupa por carpeta (en orden alfabético); dentro de cada una los temas conservan el orden que tenían."""
+        items = [self.takeItem(0) for _ in range(self.count())]
+        grupos = {}
+        for it in items:
+            grupos.setdefault(self._carpeta(it.data(Qt.ItemDataRole.UserRole)), []).append(it)
+        for carpeta in sorted(grupos, key=lambda c: os.path.basename(c).lower()):
+            cab = QListWidgetItem()
+            cab.setData(self.ROL_CAB, True)
+            cab.setData(Qt.ItemDataRole.UserRole, carpeta)
+            cab.setFlags(Qt.ItemFlag.ItemIsEnabled)                 # se puede cliquear pero no seleccionar ni cargar
+            f = QFont(self.font()); f.setBold(True); cab.setFont(f)
+            cab.setBackground(QBrush(QColor("#17566a"))); cab.setForeground(QBrush(QColor("#d8f6ff")))
+            self.addItem(cab)
+            cerrada = carpeta in self._plegadas
+            nombre = os.path.basename(carpeta) or carpeta
+            cab.setText(("▶ " if cerrada else "▼ ") + "📁 " + nombre)
+            tot = sum((self.duracion(it.data(Qt.ItemDataRole.UserRole)) or 0) for it in grupos[carpeta])
+            cab.setData(Qt.ItemDataRole.UserRole + 3, f"{len(grupos[carpeta])}" + (f" / {self._fmt_dur(tot, True)}" if tot else ""))
+            for it in grupos[carpeta]:
+                self.addItem(it)
+                it.setHidden(cerrada)
+
+    def _clic_cab(self, it):
+        if not self._es_cab(it):
+            return
+        c = it.data(Qt.ItemDataRole.UserRole)
+        if c in self._plegadas:
+            self._plegadas.discard(c)
+        else:
+            self._plegadas.add(c)
+        barra = self.verticalScrollBar().value()
+        sel = {self._clave(x.data(Qt.ItemDataRole.UserRole)) for x in self.selectedItems()}
+        self._quitar_cab(); self._poner_cab()
+        for i in range(self.count()):
+            x = self.item(i)
+            if not self._es_cab(x) and self._clave(x.data(Qt.ItemDataRole.UserRole)) in sel:
+                x.setSelected(True)
+        self.verticalScrollBar().setValue(barra)
+
+    def set_agrupado(self, v):
+        v = bool(v)
+        if v == self.agrupado:
+            return
+        if v:
+            self.agrupado = True
+            self._poner_cab()
+        else:
+            self._quitar_cab()
+            self.agrupado = False
+        self._refrescar_textos()
+        if getattr(self, "_ult_pintado", None):
+            self.pintar(*self._ult_pintado)
+
+    @staticmethod
+    def _fmt_dur(seg, largo=False):
+        seg = int(round(seg)); h, r = divmod(seg, 3600); m, sg = divmod(r, 60)
+        return f"{h}:{m:02d}:{sg:02d}" if (h or largo) else f"{m}:{sg:02d}"
+
+    def duracion(self, ruta):
+        self.info(ruta)
+        return self._memo_dur.get(self._clave(ruta))
+
     def _nombre(self, it):
         n = it.data(self.ROL_NOMBRE)
         return n if n is not None else it.text()
@@ -102,6 +221,8 @@ class Biblioteca(QListWidget):
     def _refrescar_textos(self):
         for i in range(self.count()):
             it = self.item(i)
+            if self._es_cab(it):
+                continue
             esperando = self._clave(it.data(Qt.ItemDataRole.UserRole)) in self._cola
             bpm, clave = self.info(it.data(Qt.ItemDataRole.UserRole))[:2]
             pref = (f"{bpm:.0f} - " if bpm else "") + (f"[{clave}] " if clave else "")      # ej.: "124 - [8A] nombre del tema"
@@ -111,6 +232,8 @@ class Biblioteca(QListWidget):
             nuevo = ("⏳ " if esperando else "") + pref + nom
             if it.text() != nuevo:
                 it.setText(nuevo)
+            d = self.duracion(it.data(Qt.ItemDataRole.UserRole))
+            it.setData(Qt.ItemDataRole.UserRole + 3, self._fmt_dur(d) if d else None)
 
     def marcar(self, rutas):
         """Los temas de esta lista aparecen con el reloj de arena hasta que se los analiza."""
@@ -138,6 +261,10 @@ class Biblioteca(QListWidget):
                     b = d.get("bpm"); bpm = float(b) if b is not None else None
                     fr = len(d.get("downbeats_full") or d.get("downbeats") or []) >= 9 and d.get("grid") != 0
                     hv = "voz" in d
+                    try:
+                        self._memo_dur[k] = float(d.get("duration") or 0) or None
+                    except Exception:
+                        pass
                     if "key" in d:
                         hay = True
                         cam = (d["key"] or {}).get("camelot"); nom = (d["key"] or {}).get("nombre")
@@ -153,6 +280,7 @@ class Biblioteca(QListWidget):
         self.info(ruta)
         return self._memo_frase.get(self._clave(ruta), False)
 
+    @_reagrupa
     def ordenar_inteligente(self, armonico, frase, inicio=None):
         """Ordena la lista de arriba hacia abajo como una cadena de mezcla: cada tema es el que mejor engancha con el
         anterior (clave compatible primero, BPM parecido después). Con 'frase' van primero los que tienen grilla de
@@ -209,7 +337,7 @@ class Biblioteca(QListWidget):
                 self.pintar(*self._ult_pintado)
 
     def _firmas_actuales(self):
-        return {self._firma(self.item(i).data(Qt.ItemDataRole.UserRole)) for i in range(self.count())}
+        return {self._firma(r) for r in self.todas()}
 
     def agregar(self, rutas):
         n = 0
@@ -237,6 +365,8 @@ class Biblioteca(QListWidget):
                 n += 1
         finally:
             self.setUpdatesEnabled(True)
+        if n and self.agrupado:
+            self._quitar_cab(); self._poner_cab()
         if n:
             log("biblioteca", f"+{n} tema(s) agregado(s) · total {self.count()}")
             self._refrescar_textos()
@@ -252,6 +382,8 @@ class Biblioteca(QListWidget):
             p = it.data(Qt.ItemDataRole.UserRole)
             self._rutas.discard(os.path.normcase(os.path.abspath(p)))
             self.takeItem(self.row(it))
+        if self.agrupado:
+            self._quitar_cab(); self._poner_cab()
         self.cambio.emit()
 
     def limpiar(self):
@@ -264,6 +396,8 @@ class Biblioteca(QListWidget):
         kb = os.path.normcase(os.path.abspath(ruta_b)) if ruta_b else None
         for i in range(self.count()):
             it = self.item(i)
+            if self._es_cab(it):
+                continue
             ruta = it.data(Qt.ItemDataRole.UserRole)
             k = os.path.normcase(os.path.abspath(ruta))
             if k == ka:
@@ -281,7 +415,7 @@ class Biblioteca(QListWidget):
                     it.setData(Qt.ItemDataRole.ForegroundRole, None)
 
     def todas(self):
-        return [self.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.count())]
+        return [self.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.count()) if not self._es_cab(self.item(i))]
 
     def _bpm_de(self, ruta):
         return self.info(ruta)[0]
@@ -298,6 +432,7 @@ class Biblioteca(QListWidget):
                 out.append(r)
         return out
 
+    @_reagrupa
     def ordenar_por_bpm(self):
         self.setUpdatesEnabled(False)
         try:
@@ -317,6 +452,7 @@ class Biblioteca(QListWidget):
         self._refrescar_textos()
         self.cambio.emit()
 
+    @_reagrupa
     def ordenar_por_tono(self):
         """Ordena por clave Camelot (1A, 1B, 2A, 2B … 12B); dentro de cada clave por BPM. Sin clave: al final."""
         def k(ruta, it):

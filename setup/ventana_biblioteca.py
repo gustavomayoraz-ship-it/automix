@@ -5,7 +5,7 @@ from PySide6.QtCore import QTimer, Qt
 from setup.ajustes import SUPPORTED
 from setup.analisis import _mantener_vivo
 from setup.base import log
-from setup.config import leer_config
+from setup.config import guardar_config, leer_config
 from setup.deck import Deck
 from setup.hilos_analisis import AnalizadorBiblioteca
 
@@ -95,6 +95,13 @@ class BibliotecaMixin:
         except Exception:
             import traceback; traceback.print_exc()
 
+    def _alternar_agrupada(self, v):
+        self.biblioteca.set_agrupado(bool(v))
+        if v:
+            self._ordenar_lista()                             # dentro de cada carpeta, el orden de siempre (BPM o tono)
+        guardar_config(lib_agrupada=bool(v))
+        self._set_status("📂 Lista separada por carpetas (clic en un título para cerrarlo o abrirlo)" if v else "📃 Lista plana")
+
     def _ordenar_biblioteca_tono(self):
         self._orden_tono = True                               # se mantiene mientras se analiza y suenan los temas
         self.biblioteca.ordenar_por_tono()
@@ -146,10 +153,12 @@ class BibliotecaMixin:
         t = txt.strip().lower()
         for i in range(self.biblioteca.count()):
             it = self.biblioteca.item(i)
+            if self.biblioteca._es_cab(it):
+                continue
             it.setHidden(bool(t) and t not in it.text().lower())
 
     def _biblioteca_cambio(self):
-        self.lbl_lib.setText(f"📁 Biblioteca ({self.biblioteca.count()})")
+        self.lbl_lib.setText(f"📁 Biblioteca ({len(self.biblioteca.todas())})")
         self.biblioteca.guardar()
         if self.biblioteca.count() == 0:
             self._vaciar_decks()
@@ -199,9 +208,16 @@ class BibliotecaMixin:
         clave = bib._clave(path)
         for i in range(bib.count()):
             it = bib.item(i)
+            if bib._es_cab(it):
+                continue
             if bib._clave(it.data(Qt.ItemDataRole.UserRole)) == clave:
-                if it.isHidden():                       # el filtro de búsqueda lo estaba ocultando
+                if it.isHidden():                       # el filtro de búsqueda (o una carpeta cerrada) lo estaba ocultando
                     self.ed_filtro.clear()
+                    if bib.agrupado:
+                        bib._plegadas.discard(bib._carpeta(path)); bib._quitar_cab(); bib._poner_cab()
+                        for j in range(bib.count()):
+                            if not bib._es_cab(bib.item(j)) and bib._clave(bib.item(j).data(Qt.ItemDataRole.UserRole)) == clave:
+                                it = bib.item(j); break
                 bib.clearSelection()
                 bib.setCurrentItem(it)
                 it.setSelected(True)
@@ -211,6 +227,8 @@ class BibliotecaMixin:
         self._set_status("Ese tema no está en la biblioteca")
 
     def _biblioteca_doble_clic(self, it):
+        if self.biblioteca._es_cab(it):
+            return
         p = it.data(Qt.ItemDataRole.UserRole)
         if not os.path.isfile(p): return
         a, b = self.deck_a, self.deck_b
