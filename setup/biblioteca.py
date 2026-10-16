@@ -514,6 +514,17 @@ class Biblioteca(QListWidget):
         self.agregar([u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()])
         e.acceptProposedAction()
 
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if self.count() == 0:                                   # lista vacía: indicación en el centro
+            p = QPainter(self.viewport())
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            f = QFont(self.font()); f.setPointSizeF(f.pointSizeF() * 1.25); f.setBold(True)
+            p.setFont(f); p.setPen(QColor(TEMA["suave"]))
+            r = self.viewport().rect().adjusted(16, 0, -16, 0)
+            p.drawText(r, int(Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap), "📂\n\nArrastrá carpetas o archivos acá")
+            p.end()
+
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Delete:
             self.quitar_seleccion()
