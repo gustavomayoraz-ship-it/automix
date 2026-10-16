@@ -34,19 +34,7 @@ class AuricularesMixin:
         col = QVBoxLayout(self.marco_aur); col.setContentsMargins(8, 4, 8, 4); col.setSpacing(3)
         fila1 = QHBoxLayout(); fila1.setContentsMargins(0, 0, 0, 0); fila1.setSpacing(4)
         fila1.addWidget(QLabel("<b>🎧 Auriculares</b>"))
-        self.btn_cue = {}
-        for deck, color in ((self.deck_a, COLOR_DECK_A), (self.deck_b, COLOR_DECK_B)):
-            b = QPushButton(deck.name)
-            b.setCheckable(True); b.setFixedSize(40, 26); b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            b.setStyleSheet(f"QPushButton {{ color:{color}; font-weight:bold; padding:0px; background:rgba(0,0,0,70);"
-                            f" border:1px solid {color}; border-radius:7px; }}"
-                            f"QPushButton:hover {{ background:rgba(255,255,255,30); }}"
-                            f"QPushButton:checked {{ background:{color}; color:#0b1020; }}")
-            b.setToolTip(f"Escuchar el Deck {deck.name} por los auriculares (antes del crossfader: se oye aunque a los parlantes no llegue).\n"
-                         "Podés darle play y ajustar su tempo escuchándolo solo vos.")
-            b.toggled.connect(lambda on, d=deck.name: self._cue_cambio(d, on))
-            self.btn_cue[deck.name] = b
-            fila1.addWidget(b)
+        self.btn_cue = {}                              # (los botones A/B de escucha en vivo se sacaron: se usa el play de abajo)
         fila1.addStretch(1)
         self.btn_aur_ref = QPushButton("🔄")
         self.btn_aur_ref.setFixedSize(30, 26); self.btn_aur_ref.setFocusPolicy(Qt.FocusPolicy.NoFocus)

@@ -167,7 +167,7 @@ class MultibandaMixin:
                         " border: 2px solid #8b5cf6; }")
         gd = QGridLayout(d)
         gd.setContentsMargins(16, 12, 16, 12); gd.setVerticalSpacing(5); gd.setHorizontalSpacing(8)
-        self._mb_dup = []                       # copias de los deslizadores de arriba (en manual, los automáticos se bloquean)
+        self._mb_dup = []                       # copias de los deslizadores de arriba (siguen activos también en manual)
 
         def enlazar(sl, rango, fmt, fila):
             c = QSlider(Qt.Orientation.Horizontal); c.setRange(*rango); c.setValue(sl.value()); c.setMinimumWidth(110)
@@ -325,9 +325,9 @@ class MultibandaMixin:
         mb.mb.manual = manual
         if manual:
             self._mb_manual_cambio()
-        self.sld_mb.setEnabled(not manual); self.sld_lim.setEnabled(not manual); self.sld_vel.setEnabled(not manual)
+        self.sld_mb.setEnabled(True); self.sld_lim.setEnabled(True); self.sld_vel.setEnabled(True)     # también activos en manual
         for c in getattr(self, "_mb_dup", ()):
-            c.setEnabled(not manual)
+            c.setEnabled(True)
         self.mixer.mb_activo = True
         self.mixer.golpe.cantidad = self.sld_golpe.value() / 100.0
         self.mixer.medios.db = self.sld_medios.value() / 10.0

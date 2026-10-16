@@ -94,7 +94,7 @@ class MultibandaAuto:
                     self.umbral[i], self.ratio[i], self._mk[i] = umbral, ratio, float(self.man_comp[i])
                     nivel_bloque = 20.0 * np.log10(float(np.max(np.abs(b))) + 1e-9)
                     sobre = max(0.0, nivel_bloque - umbral)
-                    objetivo = -sobre * (1.0 - 1.0 / ratio) + self._mk[i]
+                    objetivo = -sobre * (1.0 - 1.0 / ratio) * inten + self._mk[i]   # Intensidad escala tu compresión (100% = tus valores)
             elif self.niveles[i] < self.GATE_DB or inten <= 0.0:
                 objetivo = 0.0
                 self._mk[i] += 0.1 * (0.0 - self._mk[i])
@@ -490,11 +490,8 @@ class AutoMejora:
         self.eq.reset(); self.mb.reset()
 
     def procesar(self, x):
-        if self.mb.manual:           # modo manual: sin EQ inteligente, solo la multibanda con tus valores
-            self.mb.exceso = None
-            return self.mb.procesar(x)
-        y = self.eq.procesar(x)
-        self.mb.exceso = self.eq.exceso_grupos()
+        y = self.eq.procesar(x)                          # el EQ inteligente (Máx. corrección / Velocidad) sigue activo también en manual
+        self.mb.exceso = None if self.mb.manual else self.eq.exceso_grupos()
         return self.mb.procesar(y)
 
 

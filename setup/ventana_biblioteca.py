@@ -67,6 +67,9 @@ class BibliotecaMixin:
         """Con 🎼 Armónico y/o 🥁 En frase la lista se ordena como cadena de mezcla (empezando por el tema que
         suena); sin ninguna, por BPM de menor a mayor."""
         arm, fra = self.chk_armonico.isChecked(), self.chk_frases.isChecked()
+        if getattr(self, "_orden_tono", False):
+            self.biblioteca.ordenar_por_tono()
+            return
         if not (arm or fra):
             self.biblioteca.ordenar_por_bpm()
             return
@@ -92,7 +95,17 @@ class BibliotecaMixin:
         except Exception:
             import traceback; traceback.print_exc()
 
+    def _ordenar_biblioteca_tono(self):
+        self._orden_tono = True                               # se mantiene mientras se analiza y suenan los temas
+        self.biblioteca.ordenar_por_tono()
+        faltan = [r for r in self._pendientes()]
+        self._set_status("🎼 Biblioteca ordenada por tono" + (f" — analizando {len(faltan)} temas sin tono…" if faltan else ""))
+        if faltan and not self._analisis_en_curso():
+            self._ordenar_al_terminar = True
+            self._iniciar_analisis(faltan, False, self._fin_analisis, "⏳ Analizando tono")
+
     def _ordenar_biblioteca_bpm(self):
+        self._orden_tono = False
         self._ordenar_lista()                                 # ya: primero los que tienen BPM conocido
         self._fallidos = set()                                # un clic explícito vuelve a intentar los que fallaron
         faltan = self._pendientes()

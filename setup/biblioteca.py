@@ -317,6 +317,27 @@ class Biblioteca(QListWidget):
         self._refrescar_textos()
         self.cambio.emit()
 
+    def ordenar_por_tono(self):
+        """Ordena por clave Camelot (1A, 1B, 2A, 2B … 12B); dentro de cada clave por BPM. Sin clave: al final."""
+        def k(ruta, it):
+            bpm, cam, _, _ = self.info(ruta)
+            m = re.match(r"\s*(\d{1,2})\s*([ABab])", cam or "")
+            kk = (int(m.group(1)), m.group(2).upper()) if m else None
+            return (kk is None, kk or (0, ""), bpm is None, bpm or 0.0, self._nombre(it).lower())
+        self.setUpdatesEnabled(False)
+        try:
+            items = []
+            while self.count() > 0:
+                it = self.takeItem(0)
+                items.append((k(it.data(Qt.ItemDataRole.UserRole), it), it))
+            items.sort(key=lambda x: x[0])
+            for _, it in items:
+                self.addItem(it)
+        finally:
+            self.setUpdatesEnabled(True)
+        self._refrescar_textos()
+        self.cambio.emit()
+
     def guardar(self):
         try:
             BIBLIOTECA_JSON.parent.mkdir(exist_ok=True)

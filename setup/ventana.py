@@ -22,6 +22,7 @@ from setup.ventana_multibanda import MultibandaMixin
 from setup.ventana_auto import AutomaticoMixin
 from setup.ventana_auriculares import AuricularesMixin
 from setup.ventana_biblioteca import BibliotecaMixin
+from setup.ventana_efectos import EfectosMixin
 from setup.ventana_escala import EscalaMixin
 from setup.ventana_grabacion import GrabacionMixin
 from setup.ventana_loop import LoopMixin
@@ -30,7 +31,7 @@ from setup.ventana_sync import SyncMixin
 from setup.ventana_mezcla import MezclaMixin
 
 
-class AutoMix(MultibandaMixin, LoopMixin, AuricularesMixin, AutomaticoMixin, BibliotecaMixin, EscalaMixin, GrabacionMixin, RejillaMixin, SyncMixin, MezclaMixin, QMainWindow):
+class AutoMix(MultibandaMixin, EfectosMixin, LoopMixin, AuricularesMixin, AutomaticoMixin, BibliotecaMixin, EscalaMixin, GrabacionMixin, RejillaMixin, SyncMixin, MezclaMixin, QMainWindow):
     def __init__(self):
         super().__init__()
         try:
@@ -91,6 +92,11 @@ class AutoMix(MultibandaMixin, LoopMixin, AuricularesMixin, AutomaticoMixin, Bib
         lib_btns.addWidget(b_limpiar); lib_btns.addWidget(self.btn_ordenar)
         lib_btns.addWidget(self.btn_reanalizar)
         lib_lay.addLayout(lib_btns)
+        self.btn_ordenar_tono = QPushButton("🎼 Ordenar por tono")
+        self.btn_ordenar_tono.setToolTip("Ordena la lista por tonalidad (clave Camelot: 1A, 1B, 2A … 12B), y dentro de cada tono por BPM.\n"
+                                         "Los temas sin tono analizado quedan al final. Con 🔃 Ordenar por BPM se vuelve al orden anterior.")
+        self.btn_ordenar_tono.clicked.connect(self._ordenar_biblioteca_tono)
+        lib_lay.addWidget(self.btn_ordenar_tono)
         # 🎼 Armónico y 🥁 En frase se quitaron de la pantalla: quedan siempre apagados
         # (el siguiente tema es el que sigue en la lista, ordenada por BPM, y la mezcla automática arranca al llegar a la marca).
         self.chk_armonico = _OpcionApagada()
@@ -247,6 +253,7 @@ class AutoMix(MultibandaMixin, LoopMixin, AuricularesMixin, AutomaticoMixin, Bib
         self._fila_grab.addWidget(self.lbl_grab)                 # (el nombre del .wav guardado)
         self._fila_grab.addWidget(self.chk_wsola)                # misma línea que el botón Auto
         self.chk_wsola.setFixedHeight(30)
+        self._fila_grab.addWidget(self._crear_efectos())         # 🎆 efectos de sonido (lista + ▶ + volumen)
         self._fila_grab.addStretch(1)
         self._crear_auriculares()                                # columna 🎧 entre la grabación y el botón Mezclar
         self._t_grab = QTimer(self); self._t_grab.setInterval(250)

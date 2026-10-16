@@ -7,6 +7,7 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 from setup.auriculares import Auriculares
+from setup.efectos import EfectoSalida
 from setup.dsp import AutoMejora, CruceLR4, LimitadorSuave, RealceGrave, TonoAgudos, TonoMedios
 
 
@@ -106,6 +107,7 @@ class GlobalMixer:
         self.vu = (0.0, 0.0, 1.0, 1.0)     # picos L, R (a la salida), ganancia del limitador y del compensador
         self.grabador = GrabadorMezcla(sr)
         self.aur = Auriculares(sr, blocksize)      # salida de auriculares (PFL)
+        self.fx = EfectoSalida(sr)                 # efectos de sonido (sirena, bocina...) que se suman a la mezcla
         self.cortes_audio = 0              # veces que la placa pidió audio y no llegó a tiempo
         self.cb_max_ms = 0.0               # lo más que tardó un bloque desde el último aviso
 
@@ -316,6 +318,8 @@ class GlobalMixer:
         except Exception:
             self.golpe.cantidad = 0.0
             import traceback; traceback.print_exc()
+        if self.fx.buf is not None:                # el efecto entra antes del limitador: nunca se pasa de nivel
+            mix = self.fx.sumar(mix)
         mix = self.limitador.procesar(mix)
         try:
             self.nivel_vis = float(np.sqrt(np.mean(mix * mix)))
