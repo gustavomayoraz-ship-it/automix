@@ -4,7 +4,7 @@ from PySide6.QtWidgets import QCheckBox, QFrame, QGraphicsDropShadowEffect, QGri
 from PySide6.QtGui import QColor
 from PySide6.QtCore import Qt
 from setup.base import _log_diferido
-from setup.config import guardar_config, leer_config
+from setup.config import DEF_AGUDOS, DEF_GOLPE, DEF_MARCA, DEF_MB_INT, DEF_MB_LIM, DEF_MB_VEL, DEF_MEDIOS, DEF_VOLUMEN, DEF_ZOOM, guardar_config, leer_config
 from setup.teclas import TeclaGlobalF2
 from setup.tema import TEMA
 from setup.widgets import EtiquetaAncha, EtiquetaElidida, VuMeter, qss_marco
@@ -35,7 +35,7 @@ class MultibandaMixin:
         fila.addWidget(QLabel("Intensidad"))
         self.sld_mb = QSlider(Qt.Orientation.Horizontal)
         self.sld_mb.setRange(0, 100)
-        self.sld_mb.setValue(int(cfg.get("mb_int", 60)))
+        self.sld_mb.setValue(int(cfg.get("mb_int", DEF_MB_INT)))
         self.lbl_mb = EtiquetaAncha([f"{v} %" for v in range(0, 101)], f"{self.sld_mb.value()} %")
         self.lbl_mb.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         fila.addWidget(self.sld_mb, 1); fila.addWidget(self.lbl_mb); fila.addStretch(1)
@@ -86,10 +86,10 @@ class MultibandaMixin:
             lb.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             g.addWidget(et, fila_g, 0, 1, 2); g.addWidget(sl, fila_g, 2, 1, 4); g.addWidget(lb, fila_g, 6, 1, 1)
             return sl
-        self.sld_lim = deslizador(7, "Máx. corrección", 1, 10, cfg.get("mb_lim", 6), lambda v: f"±{v} dB", "Máx corrección EQ")
-        self.sld_vel = deslizador(8, "Velocidad", 1, 40, cfg.get("mb_vel", 20), lambda v: f"{v / 10:.1f} dB/s", "Velocidad EQ")
+        self.sld_lim = deslizador(7, "Máx. corrección", 1, 10, cfg.get("mb_lim", DEF_MB_LIM), lambda v: f"±{v} dB", "Máx corrección EQ")
+        self.sld_vel = deslizador(8, "Velocidad", 1, 40, cfg.get("mb_vel", DEF_MB_VEL), lambda v: f"{v / 10:.1f} dB/s", "Velocidad EQ")
 
-        self.sld_golpe = deslizador(9, "Golpe 43 Hz", 0, 100, cfg.get("golpe_43", 70), lambda v: "apagado" if v == 0 else f"{v} %",
+        self.sld_golpe = deslizador(9, "Golpe 43 Hz", 0, 100, cfg.get("golpe_43", DEF_GOLPE), lambda v: "apagado" if v == 0 else f"{v} %",
                                     "Realza el bombo y el bajo (zona de 43 Hz): empujón fijo + extra en el ataque de cada golpe + armónicos para parlantes chicos. 0 % = apagado")
         self.sld_golpe.setStyleSheet("")
         # En manual se mueven Umbral (col 1), Ratio (col 2) y Compensación (col 4) de cada banda.
@@ -100,10 +100,10 @@ class MultibandaMixin:
             for col_i, val in ((1, man_u[i]), (2, man_r[i]), (4, man_c[i])):
                 fila_m[col_i].valueChanged.connect(self._mb_manual_cambio)
             fila_m[1].setProperty("man", int(man_u[i])); fila_m[2].setProperty("man", int(man_r[i])); fila_m[4].setProperty("man", int(man_c[i]))
-        self.sld_medios = deslizador(10, "Medios (1 kHz)", -100, 60, int(cfg.get("medios_db10", 0)),
+        self.sld_medios = deslizador(10, "Medios (1 kHz)", -100, 60, int(cfg.get("medios_db10", DEF_MEDIOS)),
                                      lambda v: "0 dB" if v == 0 else f"{v / 10:+.1f} dB",
                                      "Baja (−) o sube (+) los medios con una campana ancha en 1 kHz. Para sacar solo un poquito: probá −1,0 a −2,0 dB. 0 = sin efecto")
-        self.sld_agudos = deslizador(11, "Agudos (6 kHz)", -100, 60, int(cfg.get("agudos_db10", 0)),
+        self.sld_agudos = deslizador(11, "Agudos (6 kHz)", -100, 60, int(cfg.get("agudos_db10", DEF_AGUDOS)),
                                      lambda v: "0 dB" if v == 0 else f"{v / 10:+.1f} dB",
                                      "Baja (−) o sube (+) los agudos (brillo, desde ~6 kHz). Para sacar solo un poquito: probá −1,0 a −2,0 dB. 0 = sin efecto")
         # Mezclar / Duración / Volumen general: a la derecha de los deslizadores (más compacto)
@@ -231,6 +231,17 @@ class MultibandaMixin:
                     sl.setValue(int(round(float(v))))
             finally:
                 self._mb_pintando = False
+
+    def aplicar_valores_defecto(self):
+        """Pone los controles en sus valores por defecto (multibanda, tono, volumen, zoom y marca del auto-enganche)."""
+        for sl, v in ((self.sld_mb, DEF_MB_INT), (self.sld_lim, DEF_MB_LIM), (self.sld_vel, DEF_MB_VEL), (self.sld_golpe, DEF_GOLPE),
+                      (self.sld_medios, DEF_MEDIOS), (self.sld_agudos, DEF_AGUDOS), (self.sld_master, DEF_VOLUMEN), (self.sld_zoom, DEF_ZOOM)):
+            sl.setValue(int(v))
+        try:
+            self.barra_prog.set_marca(DEF_MARCA)
+            self._marca_cambiada(DEF_MARCA)
+        except Exception:
+            import traceback; traceback.print_exc()
 
     def _vol_general_cambio(self, v):
         _log_diferido("vol", "volumen", f"general {v} %")

@@ -11,7 +11,7 @@ from setup.analisis import _cerrar_pool
 from setup.barra import BarraProgresoConMarca
 from setup.base import CONSOLA, log
 from setup.biblioteca import Biblioteca
-from setup.config import DEF_MARCA, DEF_PUNTO_A, DEF_PUNTO_B, DEF_PUNTO_S, guardar_config, leer_config
+from setup.config import DEF_AGUDOS, DEF_GOLPE, DEF_MARCA, DEF_MB_INT, DEF_MB_LIM, DEF_MB_VEL, DEF_MEDIOS, DEF_VOLUMEN, DEF_ZOOM, DEF_PUNTO_A, DEF_PUNTO_B, DEF_PUNTO_S, guardar_config, leer_config
 from setup.deck import Deck
 from setup.mezclador import GlobalMixer
 from setup.panel_cruce import PanelCruce
@@ -168,7 +168,7 @@ class AutoMix(MultibandaMixin, LoopMixin, AuricularesMixin, AutomaticoMixin, Bib
         self.sld_master = QSlider(Qt.Orientation.Horizontal)
         self.sld_master.setRange(0, 100)
         self.sld_master.setMinimumWidth(90)
-        self.sld_master.setValue(int(leer_config().get("vol_general", 100)))
+        self.sld_master.setValue(int(leer_config().get("vol_general", DEF_VOLUMEN)))
         self.lbl_master = QLabel(f"{self.sld_master.value()}%")
         self.lbl_master.setMinimumWidth(38)
         self.sld_master.valueChanged.connect(self._vol_general_cambio)
@@ -315,10 +315,10 @@ class AutoMix(MultibandaMixin, LoopMixin, AuricularesMixin, AutomaticoMixin, Bib
         zoom_row.addWidget(QLabel("Zoom (px/s):"))
         self.sld_zoom = QSlider(Qt.Orientation.Horizontal)
         self.sld_zoom.setRange(5, 300)
-        self.sld_zoom.setValue(40)
+        self.sld_zoom.setValue(DEF_ZOOM)
         self.sld_zoom.valueChanged.connect(self._update_zoom)
         zoom_row.addWidget(self.sld_zoom, stretch=1)
-        self.lbl_zoom = QLabel("40")
+        self.lbl_zoom = QLabel(str(DEF_ZOOM))
         self.lbl_zoom.setFixedWidth(50)
         zoom_row.addWidget(self.lbl_zoom)
         root.addLayout(zoom_row)
@@ -328,6 +328,7 @@ class AutoMix(MultibandaMixin, LoopMixin, AuricularesMixin, AutomaticoMixin, Bib
         tl_lay = QVBoxLayout(tl_box)
         tl_lay.setContentsMargins(4, 4, 4, 4)
         self.timeline = UnifiedTimeline(self.deck_a, self.deck_b, on_manito_cb=self._on_manito_release)
+        self.timeline.px_per_s = float(self.sld_zoom.value())
         tl_lay.addWidget(self.timeline)
         root.addWidget(tl_box, stretch=1)
 

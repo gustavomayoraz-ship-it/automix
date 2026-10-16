@@ -4,7 +4,7 @@ from PySide6.QtGui import QBrush, QColor, QFont, QLinearGradient, QPainter, QPen
 from PySide6.QtWidgets import QCheckBox, QFrame, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QSlider, QVBoxLayout, QWidget
 from PySide6.QtCore import QPointF, QRectF, QTimer, Qt
 from setup.ajustes import AJ, FUENTE_BOOST
-from setup.config import DEF_MARCA, DEF_PUNTO_A, DEF_PUNTO_B, DEF_PUNTO_S, perfil_cruce_ab, perfil_cruce_bandas
+from setup.config import DEF_PUNTO_A, DEF_PUNTO_B, DEF_PUNTO_S, perfil_cruce_ab, perfil_cruce_bandas
 from setup.tema import COLOR_DECK_A, COLOR_DECK_B, TEMA
 from setup.widgets import qss_marco
 
@@ -135,9 +135,8 @@ class PanelCruce(QFrame):
         self.chk_bandas.setChecked(True)        # por bandas
         self.chk_recetas.setChecked(False)      # recetas automáticas apagadas
         self.chk_comp.setChecked(True)          # compensar nivel
-        try:                                    # marca del auto-enganche al 50 %
-            self.v.barra_prog.set_marca(DEF_MARCA)
-            self.v._marca_cambiada(DEF_MARCA)
+        try:                                    # multibanda, tono, volumen, zoom y marca del auto-enganche
+            self.v.aplicar_valores_defecto()
         except Exception:
             import traceback; traceback.print_exc()
 
