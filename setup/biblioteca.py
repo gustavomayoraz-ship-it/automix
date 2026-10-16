@@ -405,7 +405,7 @@ class Biblioteca(QListWidget):
             elif k == kb:
                 it.setBackground(QBrush(QColor(COLOR_DECK_B))); it.setForeground(QBrush(QColor(TEMA["bg0"])))
             else:
-                nivel = compat_armonica(self._referencia, self.info(ruta)[1]) if self._referencia else None
+                nivel = compat_armonica(self._referencia, self.info(ruta)[1]) if (self._referencia and not self.agrupado) else None     # por carpetas: sin colores de compatibilidad
                 if nivel == 2:                      # misma clave o relativa
                     it.setBackground(QBrush(QColor("#0d4a30"))); it.setForeground(QBrush(QColor("#7dffbf")))
                 elif nivel == 1:                    # vecina en la rueda
