@@ -17,15 +17,19 @@ AutoMix — PySide6  (mezclador DJ de dos decks: cruce por bandas, recetas autom
 Este archivo solo abre el programa: el código está repartido en la carpeta "setup" (una parte por tema).
 """
 import sys
+import time
 from pathlib import Path
+
+_T0 = time.perf_counter()
 
 _RAIZ = str(Path(__file__).resolve().parent)
 if _RAIZ not in sys.path:
     sys.path.insert(0, _RAIZ)
 
 import setup.base          # dependencias + consola oculta (también lo corre el proceso hijo del análisis)
+_T1 = time.perf_counter()
 
 
 if __name__ == "__main__":
     from setup.ventana import main
-    main()
+    main((_T0, _T1, time.perf_counter()))

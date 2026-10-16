@@ -220,14 +220,45 @@ class GlobalMixer:
             self._comp = 1.0
         return mix
 
-    def start(self):
+    def start(self, device=None):
         if self.stream is not None:
             return
         self.stream = sd.OutputStream(
             samplerate=self.sr, channels=2, dtype="float32",
-            callback=self._cb, blocksize=self.blocksize, latency=0.12
+            callback=self._cb, blocksize=self.blocksize, latency=0.12, device=device
         )
         self.stream.start()
+
+    def reiniciar_audio(self):
+        """PortAudio solo lista los dispositivos al iniciar: los que se enchufaron o conectaron (Bluetooth) después no
+        aparecen. Esto cierra todo, vuelve a leer los dispositivos y reabre la salida principal en el MISMO dispositivo
+        de antes (aunque Windows haya cambiado el predeterminado). Corta el sonido un instante."""
+        nombre = api = None
+        try:
+            if self.stream is not None:
+                d = sd.query_devices(self.stream.device)
+                nombre = d["name"]; api = sd.query_hostapis(d["hostapi"])["name"]
+        except Exception:
+            pass
+        try: self.aur.cerrar()
+        except Exception: pass
+        self.stop()
+        try:
+            sd._terminate(); sd._initialize()
+        except Exception as e:
+            print(f"[audio] no se pudo reiniciar PortAudio ({e})")
+        idx = None
+        try:
+            if nombre:
+                for i, d in enumerate(sd.query_devices()):
+                    if d["name"] == nombre and d["max_output_channels"] >= 2 and sd.query_hostapis(d["hostapi"])["name"] == api:
+                        idx = i; break
+        except Exception:
+            pass
+        try:
+            self.start(idx)
+        except Exception:
+            self.start(None)
 
     def set_volumen(self, v01):
         self.gain_obj = float(max(0.0, min(1.0, v01))) ** 2

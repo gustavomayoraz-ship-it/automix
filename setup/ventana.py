@@ -1,5 +1,6 @@
 """AutoMix — ventana principal de AutoMix (la arman las partes ventana_*.py)."""
 import sys
+import time
 import numpy as np
 import sounddevice as sd
 from PySide6.QtWidgets import QApplication, QCheckBox, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton, QSlider, QSpinBox, QSplitter, QVBoxLayout, QWidget
@@ -480,7 +481,8 @@ def _mensajes_qt(tipo, ctx, msg):
 
 
 
-def main():
+def main(tiempos=None):
+    t_ini = time.perf_counter()
     app = QApplication(sys.argv)
     try:
         from PySide6.QtCore import qInstallMessageHandler, __version__ as _qv
@@ -494,7 +496,13 @@ def main():
             log("audio", f"no se pudo leer el dispositivo de salida ({e})")
     except Exception:
         pass
+    t_v0 = time.perf_counter()
     w = AutoMix()
+    t_v1 = time.perf_counter()
     w.show()
+    t_v2 = time.perf_counter()
+    if tiempos:
+        t0, t1, t2 = tiempos
+        log("arranque", f"dependencias {t1 - t0:.2f} s · módulos {t2 - t1:.2f} s · Qt+audio {t_v0 - t_ini:.2f} s · armar ventana {t_v1 - t_v0:.2f} s · mostrar {t_v2 - t_v1:.2f} s · TOTAL {t_v2 - t0:.2f} s")
     log("programa", f"listo · biblioteca {w.biblioteca.count()} tema(s) · duración de mezcla {w.spin_mix.value()} s")
     sys.exit(app.exec())
