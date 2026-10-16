@@ -230,6 +230,26 @@ class MezclaMixin:
 
         self._ultimo_prog_primario = prog
 
+    def _vigilar_salida(self):
+        """Si se desenchufó la placa/DAC USB, la salida pasa sola a la predeterminada de Windows."""
+        m = self.mixer
+        ahora = time.monotonic()
+        if ahora - getattr(self, "_t_vig_sal", 0) >= 0.5:
+            self._t_vig_sal = ahora
+            m.vigilar_salida()
+        msg, m._aviso_salida = m._aviso_salida, None
+        if msg:
+            log("audio", msg)
+            self._set_status(msg)
+        if getattr(m, "aur_perdida", False):
+            m.aur_perdida = False
+            try:
+                for b in self.btn_cue.values():
+                    b.setChecked(False)
+                self._aur_refrescar()
+            except Exception:
+                pass
+
     def _vigilar_cortes_audio(self):
         """Avisa en la consola cuando la salida principal se queda sin audio (trancada) o un bloque tarda demasiado."""
         m = self.mixer
@@ -248,6 +268,7 @@ class MezclaMixin:
         self.deck_a.tick()
         self.deck_b.tick()
         self._vigilar_cortes_audio()
+        self._vigilar_salida()
         self._mb_actualizar_barras()
         try:
             self._animar_cruce()

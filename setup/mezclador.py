@@ -110,6 +110,13 @@ class GlobalMixer:
         self.fx = EfectoSalida(sr)                 # efectos de sonido (sirena, bocina...) que se suman a la mezcla
         self.cortes_audio = 0              # veces que la placa pidió audio y no llegó a tiempo
         self.cb_max_ms = 0.0               # lo más que tardó un bloque desde el último aviso
+        self._cb_n = 0                     # bloques servidos (el vigilante mira que siga avanzando)
+        self._stream_cayo = False          # PortAudio avisó que la salida terminó (p. ej. desenchufaron el DAC USB)
+        self._recuperando = False
+        self._vig = (0, 0.0)               # (último _cb_n visto, momento)
+        self._aviso_salida = None          # texto para mostrar en la barra de estado (lo recoge la ventana)
+        self._sin_salida_desde = None
+        self.aur_perdida = False
 
     @staticmethod
     def _rampa(g0, g1, frames):
@@ -229,9 +236,91 @@ class GlobalMixer:
             return
         self.stream = sd.OutputStream(
             samplerate=self.sr, channels=2, dtype="float32",
-            callback=self._cb, blocksize=self.blocksize, latency=0.12, device=device
+            callback=self._cb, blocksize=self.blocksize, latency=0.12, device=device,
+            finished_callback=self._al_terminar
         )
+        self._stream_cayo = False
+        self._vig = (self._cb_n, time.monotonic())
         self.stream.start()
+
+    def _al_terminar(self):
+        """Lo llama PortAudio cuando la salida se detiene. Solo marca; el trabajo lo hace el vigilante."""
+        self._stream_cayo = True
+
+    def nombre_salida(self):
+        try:
+            return sd.query_devices(self.stream.device)["name"]
+        except Exception:
+            try:
+                return sd.query_devices(kind="output")["name"]
+            except Exception:
+                return "la salida predeterminada"
+
+    def vigilar_salida(self):
+        """Se llama desde el timer de la ventana. Si la salida principal murió (se desenchufó el DAC USB) o la de
+        auriculares quedó muerta, arranca la recuperación en otro hilo para no trancar la interfaz."""
+        s = self.stream
+        if self._recuperando:
+            return
+        a = self.aur.stream
+        if a is not None:
+            try:
+                muerto = not a.active
+            except Exception:
+                muerto = True
+            if muerto:
+                try: self.aur.cerrar()
+                except Exception: pass
+                self.aur_perdida = True
+                self._aviso_salida = "🎧 Se desconectó la salida de auriculares"
+        if s is None and self._sin_salida_desde is None:
+            return
+        ahora = time.monotonic()
+        n, t = self._vig
+        if self._cb_n != n:
+            self._vig = (self._cb_n, ahora)
+        muerto = self._stream_cayo or self._sin_salida_desde is not None
+        if not muerto and s is not None:
+            try:
+                muerto = not s.active
+            except Exception:
+                muerto = True
+            if not muerto and ahora - t > 1.5:
+                muerto = True                       # el callback dejó de llamarse
+        if muerto:
+            self._recuperando = True
+            threading.Thread(target=self._recuperar, daemon=True).start()
+
+    def _recuperar(self):
+        """Cierra lo que quedó colgado, reinicia PortAudio y abre la salida predeterminada actual. Si todavía no hay
+        ninguna, reintenta cada segundo (el sonido de los decks no avanza mientras tanto, así que sigue donde estaba)."""
+        try:
+            if self._sin_salida_desde is None:
+                self._sin_salida_desde = time.monotonic()
+                self._aviso_salida = "⚠ Se desconectó la salida de audio: buscando otra…"
+            s, self.stream = self.stream, None
+            if s is not None:
+                try: s.abort()
+                except Exception: pass
+                try: s.close()
+                except Exception: pass
+            try: self.aur.cerrar()
+            except Exception: pass
+            try:
+                sd._terminate(); sd._initialize()
+            except Exception as e:
+                print(f"[audio] no se pudo reiniciar PortAudio ({e})")
+            try:
+                self.start(None)
+            except Exception as e:
+                self.stream = None
+                print(f"[audio] sin salida disponible todavía ({e})")
+                time.sleep(1.0)
+                return                              # el vigilante vuelve a llamar y reintenta
+            self._sin_salida_desde = None
+            self._aviso_salida = f"🔊 La salida de audio se desconectó: ahora suena por {self.nombre_salida()}"
+        finally:
+            self._recuperando = False
 
     def reiniciar_audio(self):
         """PortAudio solo lista los dispositivos al iniciar: los que se enchufaron o conectaron (Bluetooth) después no
@@ -268,10 +357,15 @@ class GlobalMixer:
         self.gain_obj = float(max(0.0, min(1.0, v01))) ** 2
 
     def stop(self):
-        if self.stream:
-            self.stream.stop(); self.stream.close(); self.stream = None
+        s, self.stream = self.stream, None
+        if s:
+            try: s.stop()
+            except Exception: pass
+            try: s.close()
+            except Exception: pass
 
     def _cb(self, outdata, frames, time_info, status):
+        self._cb_n += 1
         if status and getattr(status, "output_underflow", False):
             self.cortes_audio += 1                      # la salida se quedó sin audio a tiempo (se oye como trancada)
         t_cb0 = time.perf_counter()
