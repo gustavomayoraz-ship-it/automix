@@ -69,9 +69,13 @@ class LogoAutoMix(QWidget):
         if con_nombre:                                        # "Gustavo / Mayoraz" a la derecha de AutoMix, en dos renglones
             xn = xt + QFontMetricsF(f).horizontalAdvance("AutoMix") + 12
             fm = QFontMetricsF(fn)
-            p.setFont(fn); p.setPen(QColor(TEMA["suave"]))
-            p.drawText(QPointF(xn, h * 0.60 - fm.descent()), "Gustavo")
-            p.drawText(QPointF(xn, h * 0.60 - fm.descent() + fm.height() * 0.95), "Mayoraz")
+            y1 = h * 0.60 - fm.descent(); y2 = y1 + fm.height() * 0.95
+            for txt, y in (("Gustavo", y1), ("Mayoraz", y2)):          # mismo degradé que AutoMix
+                pn = QPainterPath(); pn.addText(xn, y, fn, txt)
+                wt = fm.horizontalAdvance(txt)
+                gn = QLinearGradient(xn, 0, xn + wt, 0)
+                gn.setColorAt(0.0, QColor("#ffffff")); gn.setColorAt(0.5, QColor(TEMA["cian"])); gn.setColorAt(1.0, QColor(TEMA["magenta"]))
+                p.setPen(Qt.PenStyle.NoPen); p.setBrush(QBrush(gn)); p.drawPath(pn)
         p.end()
 
 
