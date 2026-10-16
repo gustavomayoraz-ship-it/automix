@@ -48,7 +48,10 @@ class LogoAutoMix(QWidget):
         # texto: se achica hasta que entre
         xt = x0 + n * (bw + gap) + 8
         f = QFont(self.font()); f.setPointSizeF(max(18.0, 24.0 * AJ.escala * FUENTE_BOOST)); f.setBold(True); f.setItalic(True)
-        libre = max(20.0, w - xt - 4)
+        fn = QFont(self.font()); fn.setPointSizeF(max(8.0, 10.0 * AJ.escala * FUENTE_BOOST)); fn.setBold(True)
+        ancho_n = max(QFontMetricsF(fn).horizontalAdvance("Gustavo"), QFontMetricsF(fn).horizontalAdvance("Mayoraz"))
+        con_nombre = (w - xt) >= 110 + ancho_n               # el nombre solo si la columna es lo bastante ancha
+        libre = max(20.0, w - xt - 4 - ((ancho_n + 12) if con_nombre else 0))
         for _ in range(30):
             if QFontMetricsF(f).horizontalAdvance("AutoMix") <= libre or f.pointSizeF() <= 7.0:
                 break
@@ -63,6 +66,12 @@ class LogoAutoMix(QWidget):
             f2.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 3)
             p.setFont(f2); p.setPen(QColor(TEMA["suave"]))
             p.drawText(QPointF(xt + 3, h * 0.60 + max(9.0, tam * 0.7)), "DJ  MIXER")
+        if con_nombre:                                        # "Gustavo / Mayoraz" a la derecha de AutoMix, en dos renglones
+            xn = xt + QFontMetricsF(f).horizontalAdvance("AutoMix") + 12
+            fm = QFontMetricsF(fn)
+            p.setFont(fn); p.setPen(QColor(TEMA["suave"]))
+            p.drawText(QPointF(xn, h * 0.60 - fm.descent()), "Gustavo")
+            p.drawText(QPointF(xn, h * 0.60 - fm.descent() + fm.height() * 0.95), "Mayoraz")
         p.end()
 
 
