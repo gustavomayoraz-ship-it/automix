@@ -23,12 +23,13 @@ from setup.ventana_auriculares import AuricularesMixin
 from setup.ventana_biblioteca import BibliotecaMixin
 from setup.ventana_escala import EscalaMixin
 from setup.ventana_grabacion import GrabacionMixin
+from setup.ventana_loop import LoopMixin
 from setup.ventana_rejilla import RejillaMixin
 from setup.ventana_sync import SyncMixin
 from setup.ventana_mezcla import MezclaMixin
 
 
-class AutoMix(MultibandaMixin, AuricularesMixin, AutomaticoMixin, BibliotecaMixin, EscalaMixin, GrabacionMixin, RejillaMixin, SyncMixin, MezclaMixin, QMainWindow):
+class AutoMix(MultibandaMixin, LoopMixin, AuricularesMixin, AutomaticoMixin, BibliotecaMixin, EscalaMixin, GrabacionMixin, RejillaMixin, SyncMixin, MezclaMixin, QMainWindow):
     def __init__(self):
         super().__init__()
         try:

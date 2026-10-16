@@ -270,6 +270,10 @@ class MezclaMixin:
 
     def _animar_cruce(self):
         """Los decks brillan según cuánto suenan y el botón Mezclar muestra el avance de la mezcla."""
+        try:
+            self._loop_actualizar_ui()
+        except Exception:
+            pass
         for d in (self.deck_a, self.deck_b):
             peso = max(d.vol_hi, d.vol_lo) if d.playing else 0.0
             paso = int(round(peso * 10))

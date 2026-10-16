@@ -33,8 +33,8 @@ class SmartSync:
         if not db_m or not db_s:
             return None
 
-        t_m = master.position_seconds()
-        t_s = slave.position_seconds()
+        t_m = master.position_virtual_seconds()
+        t_s = slave.position_virtual_seconds()
 
         next_m = SmartSync._next_event_after(db_m, t_m, master.analysis["bpm"])
         next_s = SmartSync._next_event_after(db_s, t_s, slave.analysis["bpm"])
@@ -74,7 +74,7 @@ class SmartSync:
         arr = np.asarray(db, dtype=np.float64)
         if len(arr) < 3:
             return None
-        t = (pos / deck.sr) if pos is not None else deck.position_seconds()
+        t = (pos / deck.sr) if pos is not None else deck.position_virtual_seconds()
         rate = max(1e-6, deck.rate_eff)
         i = int(np.searchsorted(arr, t))
         lo = max(0, min(i - n // 2, len(arr) - n))

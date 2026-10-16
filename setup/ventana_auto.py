@@ -49,7 +49,7 @@ class AutomaticoMixin:
         if not voz:
             return None
         dt = float(an.get("voz_dt", 0.5))
-        pos = deck.position_seconds(); rate = max(1e-6, deck.rate_eff)
+        pos = deck.position_virtual_seconds(); rate = max(1e-6, deck.rate_eff)
         out = []
         for i in range(int(dur_total / 0.5) + 1):
             k = int((pos + i * 0.5 * rate) / dt)
@@ -236,7 +236,7 @@ class AutomaticoMixin:
         db = self._db_de(sale)
         if len(db) < self.FRASE_COMPASES + 1 or sale.audio is None:
             return None
-        pos = sale.position_seconds()
+        pos = sale.position_virtual_seconds()
         lim = db[::self.FRASE_COMPASES]
         sig = lim[lim > pos + 0.12]
         if not len(sig):
@@ -276,7 +276,7 @@ class AutomaticoMixin:
             espera = self._hasta_proxima_frase(sale)
             if espera is not None:
                 dur = self._duracion_mezcla_para(sale, entra, True)
-                resta = (len(sale.audio) - sale.cursor) / (sale.sr * max(1e-6, sale.rate_eff))
+                resta = (len(sale.audio) - sale.cursor - sale.loop_desfase) / (sale.sr * max(1e-6, sale.rate_eff))
                 if espera + dur + 4.0 > resta:        # esperar a la frase no deja tiempo: se mezcla ya
                     espera = None
         if espera is None or espera < 0.05:
@@ -337,7 +337,7 @@ class AutomaticoMixin:
             return
         if espera.audio is None or not espera.analysis:
             return
-        resta = (len(sonando.audio) - sonando.cursor) / (sonando.sr * max(1e-6, sonando.rate_eff))
+        resta = (len(sonando.audio) - sonando.cursor - sonando.loop_desfase) / (sonando.sr * max(1e-6, sonando.rate_eff))
         if resta <= max(float(self.auto_s), self.spin_mix.value() + 4.0):   # +3 s de pausa al 50 % +1 s de margen
             self._set_status(f"🔁 Mezcla automática hacia el Deck {espera.name}")
             self._disparar_mezcla_auto()

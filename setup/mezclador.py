@@ -237,11 +237,12 @@ class GlobalMixer:
             self.stream.stop(); self.stream.close(); self.stream = None
 
     def _cb(self, outdata, frames, time_info, status):
-        pa = self.deck_a.cursor + self.deck_a._cursor_frac          # posición al INICIO del bloque (para caer en el compás)
-        pb = self.deck_b.cursor + self.deck_b._cursor_frac
+        pa = self.deck_a.cursor + self.deck_a._cursor_frac + self.deck_a.loop_desfase          # posición al INICIO del bloque (para caer en el compás)
+        pb = self.deck_b.cursor + self.deck_b._cursor_frac + self.deck_b.loop_desfase
         a = self.deck_a.render(frames)
         b = self.deck_b.render(frames)
-        self.snap_pos = (self.deck_a.cursor + self.deck_a._cursor_frac, self.deck_b.cursor + self.deck_b._cursor_frac)
+        self.snap_pos = (self.deck_a.cursor + self.deck_a._cursor_frac + self.deck_a.loop_desfase,
+                         self.deck_b.cursor + self.deck_b._cursor_frac + self.deck_b.loop_desfase)
         try:
             self.aur.alimentar(a, b)
         except Exception:

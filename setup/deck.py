@@ -43,6 +43,12 @@ class Deck(QFrame):
         self.original_bpm = None
         self._ws = WsolaFlujo(); self._ws_activo = False; self._ws_exp = None      # estirado de tiempo sin cambiar el tono
         self._ws_modo = False
+        self.loop = None               # (inicio, fin) en muestras del tema mientras hay un loop activo
+        self.loop_desfase = 0.0        # muestras que el loop "retrocedió" en total: posición virtual = cursor + desfase
+        self._loop_salir = False       # pedido (desde la interfaz) de soltar el loop
+        self._fi_pend = False          # el próximo bloque empieza con un fundido de entrada (después de un salto)
+        self._fi_pos = 0               # cuánto del fundido de entrada ya se aplicó
+        self._ws_fi_pos = 128          # ídem, para la entrada suave del estirado (128 = terminado)
 
         self.setAcceptDrops(True)
         self._acento = color
@@ -371,6 +377,7 @@ class Deck(QFrame):
             self.cursor = 0
             self._cursor_frac = 0.0
             self._ws_activo = False
+            self.loop = None; self.loop_desfase = 0.0; self._loop_salir = False
 
     RESET_SUAVE_S = 3.0          # el botón Reset vuelve al 100 % progresivamente (si el tema está sonando)
 
@@ -499,6 +506,11 @@ class Deck(QFrame):
         with self.lock:
             return self.cursor / self.sr if self.audio is not None else 0.0
 
+    def position_virtual_seconds(self):
+        """Posición como si el tema NO estuviera en loop (la que usan la sincronía y la mezcla automática)."""
+        with self.lock:
+            return (self.cursor + self._cursor_frac + self.loop_desfase) / self.sr if self.audio is not None else 0.0
+
     def set_position_seconds(self, t):
         if self.audio is None:
             return
@@ -506,6 +518,7 @@ class Deck(QFrame):
         with self.lock:
             self.cursor = int(t * self.sr)
             self._cursor_frac = 0.0
+            self.loop = None; self.loop_desfase = 0.0; self._loop_salir = False      # mover el tema a mano suelta el loop
 
     def tick(self):
         if self.analysis and self.audio is not None:
@@ -567,8 +580,11 @@ class Deck(QFrame):
             self._ws_activo = True
         y, fin = self._ws.leer(self.audio, frames, float(np.clip(rate, 0.5, 2.0)))
         if salto:
-            k = min(128, frames)
-            y[:k] *= np.linspace(0.0, 1.0, k, dtype=np.float32)[:, None]      # entrada suave: sin chasquido al saltar
+            self._ws_fi_pos = 0                                              # entrada suave: sin chasquido al saltar
+        if self._ws_fi_pos < 128:                                            # (el fundido sigue en los bloques siguientes si este es corto)
+            k = min(128 - self._ws_fi_pos, frames)
+            y[:k] *= ((np.arange(k, dtype=np.float32) + self._ws_fi_pos + 1.0) / 128.0)[:, None]
+            self._ws_fi_pos += k
         h = self._ws.head
         self.cursor = int(h)
         self._cursor_frac = h - self.cursor
@@ -577,7 +593,7 @@ class Deck(QFrame):
             self.playing = False
         return y
 
-    def render(self, frames):
+    def _render_bloque(self, frames):
         out = np.zeros((frames, 2), dtype=np.float32)
         with self.lock:
             if not self.playing or self.audio is None:
@@ -608,3 +624,111 @@ class Deck(QFrame):
                 y = self._render_directo(frames, rate)
             out[:] = y * ganancia_total
         return out
+
+    # ---- LOOP (repetir un trozo del tema, pegado a la grilla) ---------------------------------
+    LOOP_FADE = 48            # muestras (~1 ms) de fundido en el empalme del loop: sin chasquido
+
+    def render(self, frames):
+        if self.loop is None and not self._loop_salir:
+            return self._render_bloque(frames)
+        return self._render_loop(frames)
+
+    def iniciar_loop(self, n_beats):
+        """Loop de n_beats tiempos, desde el golpe más cercano. Devuelve True si pudo."""
+        if self.audio is None or not self.analysis:
+            return False
+        b = np.asarray(self.analysis.get("beats_full") or self.analysis.get("beats") or [], dtype=np.float64)
+        if len(b) < 12:
+            return False
+        with self.lock:
+            pos = (self.cursor + self._cursor_frac) / self.sr
+            i = int(np.argmin(np.abs(b - pos)))
+            ini = float(b[i])
+            if i + n_beats < len(b):
+                fin = float(b[i + n_beats])
+            else:
+                paso = float(np.median(np.diff(b[max(0, i - 8):i + 1]))) if i >= 2 else 60.0 / max(60.0, float(self.analysis.get("bpm", 120)))
+                fin = ini + n_beats * paso
+            if fin * self.sr >= len(self.audio) - 2 or fin - ini < 0.05:
+                return False
+            self.loop = (ini * self.sr, fin * self.sr)
+            self.loop_desfase = 0.0
+            self._loop_salir = False
+        return True
+
+    def terminar_loop(self):
+        """Suelta el loop: el tema sigue por donde estaría si nunca hubiera repetido (así no se pierde el compás)."""
+        if self.loop is None:
+            return
+        if self.playing:
+            self._loop_salir = True            # lo resuelve el audio en el próximo bloque, con fundido
+        else:
+            self._saltar_a_virtual()
+
+    def _saltar_a_virtual(self):
+        with self.lock:
+            if self.audio is not None:
+                virt = min(self.cursor + self._cursor_frac + self.loop_desfase, len(self.audio) - 2.0)
+                self.cursor = int(virt); self._cursor_frac = virt - self.cursor
+            self.loop = None; self.loop_desfase = 0.0; self._loop_salir = False
+
+    def _aplicar_fi(self, y, F):
+        """Fundido de entrada tras un salto del loop (continúa en el bloque siguiente si este es muy corto)."""
+        if self._fi_pend:
+            k = min(F - self._fi_pos, len(y))
+            if k > 0:
+                y[:k] *= ((np.arange(k, dtype=np.float32) + self._fi_pos + 1.0) / F)[:, None]
+                self._fi_pos += k
+            if self._fi_pos >= F:
+                self._fi_pend = False; self._fi_pos = 0
+        return y
+
+    def _tramo_loop(self, n, F):
+        """n muestras de salida respetando el loop: al llegar al final vuelve al inicio (con fundidos de ~1 ms)."""
+        out = np.zeros((n, 2), dtype=np.float32)
+        h = 0; vueltas = 0
+        while h < n and vueltas < 12:
+            vueltas += 1
+            with self.lock:
+                lp = self.loop
+                if lp is None or not self.playing or self.audio is None:
+                    break
+                pos = self.cursor + self._cursor_frac
+                rate = max(1e-6, self.rate_eff)
+            ini, fin = lp
+            m = int(np.ceil(max(0.0, fin - pos) / rate)); m = max(1, min(m, n - h))
+            y = self._render_bloque(m)
+            self._aplicar_fi(y, F)
+            out[h:h + m] = y; h += m
+            with self.lock:
+                if self.loop is None:
+                    break
+                pos2 = self.cursor + self._cursor_frac
+                if pos2 >= fin - 2.0 * rate:                       # llegó al final del loop: vuelve al inicio
+                    over = max(0.0, pos2 - fin)
+                    nueva = ini + over
+                    self.cursor = int(nueva); self._cursor_frac = nueva - self.cursor
+                    self.loop_desfase += (fin - ini)
+                    k = min(F, h)
+                    if k > 0:
+                        out[h - k:h] *= np.linspace(1.0, 0.0, k, dtype=np.float32)[:, None]
+                    self._fi_pend = True; self._fi_pos = 0
+        if h < n:
+            y = self._render_bloque(n - h)
+            self._aplicar_fi(y, F)
+            out[h:] = y
+        return out
+
+    def _render_loop(self, frames):
+        F = max(8, min(self.LOOP_FADE, frames // 4))
+        if self._loop_salir and self.loop is not None:
+            self._loop_salir = False
+            out = np.zeros((frames, 2), dtype=np.float32)
+            out[:F] = self._tramo_loop(F, F) * np.linspace(1.0, 0.0, F, dtype=np.float32)[:, None]
+            self._saltar_a_virtual()
+            self._fi_pend = True; self._fi_pos = 0
+            y = self._render_bloque(frames - F)
+            out[F:] = self._aplicar_fi(y, F)
+            return out
+        self._loop_salir = False
+        return self._tramo_loop(frames, F)

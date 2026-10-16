@@ -120,7 +120,9 @@ class MultibandaMixin:
         self.btn_mix.setGraphicsEffect(_glow)
         # El botón Mezclar va abajo, a la derecha (debajo del Deck B), a la altura de la fila "Rejilla B"
         col_mix = QVBoxLayout(); col_mix.setContentsMargins(0, 0, 0, 0); col_mix.setSpacing(0)
-        col_mix.addSpacing(30)                    # queda a la altura de la fila "Rejilla B"
+        col_mix.setContentsMargins(0, -10, 0, 0)  # el cuadro del loop sube un poco, por encima de la fila "Rejilla A"
+        col_mix.addWidget(self._crear_loop())     # 🔁 Loop + largo (¼ ½ 1 2), arriba del botón Mezclar
+        col_mix.addSpacing(6)
         self.btn_mix.setMinimumWidth(230)
         col_mix.addWidget(self.btn_mix)
         self.chk_f2g = QCheckBox("⌨ F2 funciona con el programa en segundo plano")
