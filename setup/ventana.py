@@ -307,7 +307,7 @@ class AutoMix(MultibandaMixin, EfectosMixin, LoopMixin, AuricularesMixin, Automa
         self._f_dur.insertWidget(self._f_dur.count() - 1, self.btn_esquina)   # al lado de la consola
 
         barra_box = QGroupBox("⚓ Auto-enganche — progreso del tema sonando")
-        barra_box.setFixedHeight(84)
+        barra_box.setFixedHeight(92)
         barra_box.setStyleSheet(qss_marco("QGroupBox", TEMA["ambar"]))
         bl = QHBoxLayout(barra_box)
         bl.setContentsMargins(8, 6, 8, 4)

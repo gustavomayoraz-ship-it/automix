@@ -18,8 +18,8 @@ class BarraProgresoConMarca(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setMinimumHeight(50)
-        self.setMaximumHeight(50)
+        self.setMinimumHeight(58)
+        self.setMaximumHeight(58)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.progreso = 0.0
         self.prog_seg = 0.0
@@ -62,9 +62,9 @@ class BarraProgresoConMarca(QWidget):
         w, h = self.width(), self.height()
         m = self.MARGEN
 
-        y_top = 3
-        y_prog_t = 11
-        y_prog_b = h - 5
+        y_top = 2
+        y_prog_t = 8                    # barra más alta y centrada: mismo aire arriba que abajo
+        y_prog_b = h - 8
         hh = y_prog_b - y_prog_t
         ancho = w - 2 * m
         rad = min(8.0, hh / 2.0)
@@ -72,7 +72,7 @@ class BarraProgresoConMarca(QWidget):
         p.setPen(QPen(QColor(255, 255, 255, 40), 1))                      # reglita de cuartos
         for f in (0.25, 0.5, 0.75):
             x = self._x_de_frac(f)
-            p.drawLine(int(x), y_top, int(x), y_top + 5)
+            p.drawLine(int(x), 1, int(x), 5)
 
         fondo = QLinearGradient(0, y_prog_t, 0, y_prog_b)
         fondo.setColorAt(0.0, QColor("#04060b")); fondo.setColorAt(1.0, QColor("#0d1220"))
@@ -146,4 +146,4 @@ class BarraProgresoConMarca(QWidget):
         self.update()
 
     def sizeHint(self):
-        return QSize(500, 50)
+        return QSize(500, 58)
