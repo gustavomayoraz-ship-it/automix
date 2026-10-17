@@ -207,6 +207,7 @@ class AuricularesMixin:
         if d is not None and aur.abrir(d[0], nombre, d[2], d[3]):
             self._aur_nombre_pref = nombre
             guardar_config(aur_nombre=nombre)
+            self._aur_vol_de(nombre)
             log("audio", f"auriculares: {nombre} (abrió en {time.perf_counter() - t0:.2f} s)")
             self._set_status(f"🎧 Auriculares: {nombre}")
             return True
@@ -273,7 +274,28 @@ class AuricularesMixin:
         b = self.btn_cue[nombre_deck]
         b.blockSignals(True); b.setChecked(False); b.blockSignals(False)
 
+    @staticmethod
+    def _aur_clave(nombre):
+        return " ".join(nombre.split(" [")[0].replace(" · mono", "").lower().split())
+
     def _aur_vol_cambio(self, v):
-        self.mixer.aur.vol = v / 100.0
+        aur = self.mixer.aur
+        aur.vol = v / 100.0
         self.lbl_aur.setText(f"{v} %")
-        guardar_config(aur_vol=int(v))
+        kw = {"aur_vol": int(v)}
+        if aur.activo and aur.nombre:                    # el volumen se recuerda por aparato (DAC, Bluetooth…)
+            vols = dict(leer_config().get("aur_vols", {}))
+            vols[self._aur_clave(aur.nombre)] = int(v)
+            kw["aur_vols"] = vols
+        guardar_config(**kw)
+
+    def _aur_vol_de(self, nombre):
+        """Pone el volumen que tenía este aparato la última vez (si es la primera, queda el actual y se guarda)."""
+        v = leer_config().get("aur_vols", {}).get(self._aur_clave(nombre))
+        if v is None:
+            v = self.sld_aur.value()
+        v = max(0, min(100, int(v)))
+        if v != self.sld_aur.value():
+            self.sld_aur.setValue(v)                     # dispara _aur_vol_cambio, que lo guarda
+        else:
+            self._aur_vol_cambio(v)
