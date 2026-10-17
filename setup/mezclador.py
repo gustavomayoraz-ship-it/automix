@@ -268,11 +268,21 @@ class GlobalMixer:
                 muerto = not a.active
             except Exception:
                 muerto = True
+            ahora = time.monotonic()
+            if not muerto and ahora - getattr(self, "_t_pres", 0) >= 1.0:
+                # Windows a veces mueve solo un stream al dispositivo predeterminado cuando su aparato desaparece: el
+                # stream sigue "vivo" pero suena por donde no debe. Por eso se mira si el aparato sigue conectado.
+                self._t_pres = ahora
+                self._no_pres = 0 if self.aur.sigue_presente() else getattr(self, "_no_pres", 0) + 1
+                muerto = self._no_pres >= 2
             if muerto:
+                self._no_pres = 0
                 try: self.aur.cerrar()
                 except Exception: pass
+                for p in self.aur.prev.values():
+                    p.playing = False
                 self.aur_perdida = True
-                self._aviso_salida = "🎧 Se desconectó la salida de auriculares"
+                self._aviso_salida = "🎧 Se desconectaron los auriculares: la previa se detuvo"
         if s is None and self._sin_salida_desde is None:
             return
         ahora = time.monotonic()

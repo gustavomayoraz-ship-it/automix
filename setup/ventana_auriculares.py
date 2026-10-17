@@ -102,7 +102,7 @@ class AuricularesMixin:
 
     def _aur_refrescar(self):
         """Lee los dispositivos de salida y los pone en la lista, manteniendo la elección."""
-        dev = self.mixer.aur.listar()
+        dev = self.mixer.aur.listar(self.mixer.nombre_salida())
         actual = self.cmb_aur.currentData()
         bloq = self.cmb_aur.blockSignals(True)
         self.cmb_aur.clear()
@@ -123,7 +123,7 @@ class AuricularesMixin:
             b.setChecked(False)
         self.mixer.reiniciar_audio()
         self._aur_refrescar()
-        dev = aur.listar()
+        dev = aur.listar(self.mixer.nombre_salida())
         for i, v, ch, api in dev:
             log("audio", f"salida {i}: {v} · {ch} canales · {api}")
         if pref:
@@ -131,6 +131,60 @@ class AuricularesMixin:
             if j >= 0:
                 self.cmb_aur.setCurrentIndex(j)
         self._set_status(f"🔄 {len(dev)} salidas de audio encontradas — elegí tus auriculares en la lista")
+
+    def _aur_auto_dispositivos(self):
+        """Vigila (1 vez por segundo) los aparatos de audio que tiene Windows. Si se conectó o desconectó uno, espera a
+        que se estabilice, reinicia PortAudio para que lo vea y actualiza la lista; si apareció un aparato nuevo (o volvió
+        el que ya usabas), lo elige y abre solo. Reemplaza al botón 🔄, que queda por si hace falta."""
+        ahora = time.monotonic()
+        if ahora - getattr(self, "_t_dev", 0) < 1.0 or self.mixer._recuperando:
+            return
+        self._t_dev = ahora
+        aur = self.mixer.aur
+        pres = aur.nombres_presentes()
+        if pres is None:
+            return
+        pres = frozenset(pres)
+        base = getattr(self, "_dev_base", None)
+        if base is None:
+            self._dev_base = pres
+            return
+        if pres == base:
+            self._dev_visto = None
+            return
+        if pres != getattr(self, "_dev_visto", None):
+            self._dev_visto = pres                       # cambió: esperar a que Windows termine de registrarlo
+            self._dev_t = ahora
+            return
+        if ahora - self._dev_t < 1.5:
+            return
+        nuevos = pres - base
+        self._dev_base = pres
+        self._dev_visto = None
+        pref = self._aur_nombre_pref
+        self.mixer.reiniciar_audio()
+        self._aur_refrescar()
+        dev = aur.listar(self.mixer.nombre_salida())
+        for i, v, ch, api in dev:
+            log("audio", f"salida {i}: {v} · {ch} canales · {api}")
+        elegir = None
+        if nuevos:
+            cand = sorted((x for x in dev if any(aur.coincide(x[1], p) for p in nuevos)), key=lambda x: x[2] < 2)
+            if cand:
+                elegir = next((x[1] for x in cand if x[1] == pref), None)
+                if elegir is None and not aur.activo:
+                    elegir = cand[0][1]
+        if elegir is None and pref and self.cmb_aur.findData(pref) >= 0:
+            elegir = pref                                # reabrir lo que ya usabas si sigue estando
+        if elegir:
+            j = self.cmb_aur.findData(elegir)
+            if j >= 0:
+                if j == self.cmb_aur.currentIndex():
+                    self._aur_abrir(elegir)
+                else:
+                    self.cmb_aur.setCurrentIndex(j)      # dispara la apertura
+                return
+        self._set_status("🔄 Cambió la lista de dispositivos de audio")
 
     def _aur_dispositivo_cambio(self, *_):
         aur = self.mixer.aur
@@ -149,7 +203,7 @@ class AuricularesMixin:
         if aur.activo and aur.nombre == nombre:
             return True
         t0 = time.perf_counter()
-        d = next((x for x in aur.listar() if x[1] == nombre), None)
+        d = next((x for x in aur.listar(self.mixer.nombre_salida()) if x[1] == nombre), None)
         if d is not None and aur.abrir(d[0], nombre, d[2], d[3]):
             self._aur_nombre_pref = nombre
             guardar_config(aur_nombre=nombre)

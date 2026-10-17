@@ -237,6 +237,10 @@ class MezclaMixin:
         if ahora - getattr(self, "_t_vig_sal", 0) >= 0.5:
             self._t_vig_sal = ahora
             m.vigilar_salida()
+        try:
+            self._aur_auto_dispositivos()
+        except Exception:
+            import traceback; traceback.print_exc()
         msg, m._aviso_salida = m._aviso_salida, None
         if msg:
             log("audio", msg)
@@ -246,6 +250,8 @@ class MezclaMixin:
             try:
                 for b in self.btn_cue.values():
                     b.setChecked(False)
+                for nom, b in getattr(self, "btn_prev", {}).items():
+                    b.blockSignals(True); b.setChecked(False); b.blockSignals(False)
                 self._aur_refrescar()
             except Exception:
                 pass

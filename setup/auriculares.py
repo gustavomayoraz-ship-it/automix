@@ -45,7 +45,7 @@ class Auriculares:
 
     # ---- dispositivos -------------------------------------------------
     @staticmethod
-    def listar():
+    def listar(excluir=None):
         """[(índice, nombre para mostrar, canales, API de audio)] de todas las salidas. Las de la API que usa el programa
         van primero y con su nombre a secas; las de otras APIs (WASAPI, DirectSound) llevan [API] al final. Los auriculares
         Bluetooth a veces solo aparecen en alguna de ellas, o como mono (perfil de llamadas)."""
@@ -74,7 +74,64 @@ class Auriculares:
         except Exception:
             pass
         res.sort(key=lambda x: (not x[4], x[0]))
-        return [(i, v, ch, api) for i, v, ch, api, _ in res]
+        # solo lo que sirve: sin las entradas genéricas de Windows, sin repetidos (el mismo aparato aparece una vez por
+        # cada API de audio; MME recorta los nombres a ~31 letras) y sin el aparato que ya usa la salida principal
+        def norm(t):
+            return " ".join(t.lower().split())[:28]
+        ex = norm(excluir) if excluir else None
+        vistos, fin = set(), []
+        for i, v, ch, api, _ in res:
+            base = norm(v.split(" [")[0].replace(" · mono", ""))
+            bajo = base
+            if any(k in bajo for k in ("primario", "primary sound", "sound mapper", "asignador", "mapeador")):
+                continue
+            if ex and (base == ex or base.startswith(ex[:20]) and ex.startswith(base[:20])):
+                continue
+            clave = (base, ch == 1)
+            if clave in vistos:
+                continue
+            vistos.add(clave)
+            fin.append((i, v, ch, api))
+        return fin
+
+    @staticmethod
+    def nombres_presentes():
+        """Nombres (en minúscula) de las salidas que Windows tiene AHORA, leídas directo de winmm sin tocar PortAudio
+        (PortAudio solo ve los dispositivos del momento en que arrancó). None si no se puede saber."""
+        try:
+            import os, ctypes
+            if os.name != "nt":
+                return None
+            from ctypes import wintypes as w
+
+            class CAPS(ctypes.Structure):
+                _fields_ = [("mid", w.WORD), ("pid", w.WORD), ("ver", w.UINT), ("nombre", ctypes.c_wchar * 32),
+                            ("formatos", w.DWORD), ("canales", w.WORD), ("r", w.WORD), ("soporte", w.DWORD)]
+            winmm = ctypes.windll.winmm
+            res = []
+            for i in range(winmm.waveOutGetNumDevs()):
+                c = CAPS()
+                if winmm.waveOutGetDevCapsW(ctypes.c_size_t(i), ctypes.byref(c), ctypes.sizeof(c)) == 0:
+                    res.append(" ".join(c.nombre.lower().split()))
+            return res or None
+        except Exception:
+            return None
+
+    def sigue_presente(self):
+        """False si el dispositivo de auriculares abierto ya no figura en Windows (lo desenchufaron o se apagó)."""
+        if self.stream is None or not self.nombre:
+            return True
+        pres = self.nombres_presentes()
+        if pres is None:
+            return True
+        return any(self.coincide(self.nombre, p) for p in pres)
+
+    @staticmethod
+    def coincide(nombre, presente):
+        """¿El nombre que muestra la lista corresponde a este nombre de winmm (recortado a 31 letras)?"""
+        base = " ".join(nombre.split(" [")[0].replace(" · mono", "").lower().split())
+        p = presente
+        return len(p) >= 6 and (p in base or base in p or base[:28] == p[:28])
 
     @property
     def activo(self):
