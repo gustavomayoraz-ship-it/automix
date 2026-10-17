@@ -173,7 +173,9 @@ class MezclaMixin:
         self._marca_disparada = False
         prim = self._deck_primario()
         if prim is not None and prim.analysis and prim.analysis.get("duration", 0) > 0:
-            self._ultimo_prog_primario = prim.position_seconds() / prim.analysis["duration"]
+            d = float(prim.analysis["duration"]); fin = self._fin_audible(prim)
+            d = min(d, fin) if fin > 1.0 else d
+            self._ultimo_prog_primario = min(1.0, prim.position_seconds() / d)
         else:
             self._ultimo_prog_primario = 0.0
         guardar_config(marca_frac=self._marca_frac)
@@ -186,6 +188,41 @@ class MezclaMixin:
         if not hasattr(self, "lbl_marca"):
             return
         self.lbl_marca.setText(f"⚓ Marca: {self._marca_frac * 100:.1f}%\nDoble clic para restablecer")
+
+    UMBRAL_SILENCIO = 0.004        # ≈ -48 dBFS: por debajo de esto se considera silencio
+    SILENCIO_MIN = 3.0             # el silencio del final tiene que durar al menos esto (s) para tenerlo en cuenta
+
+    def _fin_audible(self, deck):
+        """Segundo en que termina la música del tema (sin el silencio del final). Si no hay silencio final largo,
+        devuelve la duración completa. Se calcula una vez por tema cargado."""
+        a = deck.audio
+        if a is None:
+            return 0.0
+        c = getattr(deck, "_fin_cache", None)
+        if c is not None and c[0] is a:
+            return c[1]
+        sr = max(1, int(deck.sr))
+        total = len(a) / sr
+        fin = total
+        try:
+            import numpy as np
+            x = np.abs(a)
+            if x.ndim > 1:
+                x = x.max(axis=1)
+            bloque = max(1, sr // 10)                    # bloques de 0,1 s
+            n = len(x) // bloque
+            if n > 0:
+                pic = x[: n * bloque].reshape(n, bloque).max(axis=1)
+                con = np.nonzero(pic > self.UMBRAL_SILENCIO)[0]
+                ultimo = (int(con[-1]) + 1) * bloque / sr if len(con) else 0.0
+                if total - ultimo >= self.SILENCIO_MIN and ultimo > 5.0:
+                    fin = ultimo + 0.5                   # un resto de cola
+                    log("silencio", f"deck {deck.name}: la música termina en {fmt_time(fin)}; "
+                                    f"los últimos {fmt_time(total - fin)} son silencio")
+        except Exception:
+            fin = total
+        deck._fin_cache = (a, fin)
+        return fin
 
     def _tick_auto_enganche(self):
         prim = self._deck_primario()
@@ -202,9 +239,12 @@ class MezclaMixin:
 
         dur = float(prim.analysis["duration"])
         seg = float(prim.position_seconds())
-        prog = max(0.0, min(1.0, seg / dur if dur > 0 else 0.0))
-
-        self.barra_prog.set_progreso(prog, seg, dur)
+        prog_barra = max(0.0, min(1.0, seg / dur if dur > 0 else 0.0))
+        self.barra_prog.set_progreso(prog_barra, seg, dur)
+        # La marca se mide sobre la parte CON música: si el tema trae silencio al final, no se espera a que pase.
+        fin = self._fin_audible(prim)
+        dur_ef = min(dur, fin) if fin > 1.0 else dur
+        prog = max(0.0, min(1.0, seg / dur_ef if dur_ef > 0 else 0.0))
 
         if self._marca_frac >= 0 and not self._marca_disparada:
             if self._ultimo_prog_primario < self._marca_frac <= prog:
@@ -213,6 +253,12 @@ class MezclaMixin:
                 self._set_status(
                     f"⚓ Auto-enganche disparado (marca {self._marca_frac * 100:.1f}%) → mezcla"
                 )
+            elif (not getattr(self, "_marca_pendiente", False) and dur_ef < dur - 0.5 and seg >= dur_ef
+                  and prim.playing and not (self.mix_timer.isActive() or self.mix_pausa_timer.isActive())):
+                # entró (o saltó) directo al silencio del final sin cruzar la marca: se mezcla igual
+                self._marca_pendiente = True; self._marca_t_reintento = 0.0
+                log("auto-enganche", "silencio al final del tema → mezcla")
+                self._set_status("🔇 Silencio al final del tema → mezcla")
             if getattr(self, "_marca_pendiente", False):
                 # Si al cruzar la marca no se pudo arrancar (el otro deck aún sin análisis/tonalidad, sin tema cargado…),
                 # se reintenta cada segundo hasta que la mezcla arranque (antes se perdía y el tema se pasaba de largo).
