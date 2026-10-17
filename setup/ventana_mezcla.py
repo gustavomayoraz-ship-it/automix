@@ -303,8 +303,14 @@ class MezclaMixin:
                 pass
 
     def _vigilar_cortes_audio(self):
-        """Avisa en la consola cuando la salida principal se queda sin audio (trancada) o un bloque tarda demasiado."""
+        """Avisa en la consola cuando la salida principal se queda sin audio (trancada) o un bloque tarda demasiado.
+        Además consume la bandera de error del callback (que NUNCA debe imprimir por su cuenta)."""
         m = self.mixer
+        # errores del callback: el callback solo marca, la UI imprime
+        e = m._err_flag
+        if e:
+            m._err_flag = 0
+            log("audio", f"⚠ error en el callback de audio ({m.ERR.get(e, e)}): esa parte se desactivó para no cortar el sonido")
         n = m.cortes_audio
         if n != getattr(self, "_cortes_vistos", 0):
             log("audio", f"⚠ corte de audio en la salida principal (van {n}) · bloque más lento: {m.cb_max_ms:.0f} ms"

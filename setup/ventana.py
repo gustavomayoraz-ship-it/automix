@@ -75,10 +75,23 @@ class AutoMix(MultibandaMixin, EfectosMixin, LoopMixin, AuricularesMixin, Automa
         self.lbl_lib = EtiquetaElidida("📁 Biblioteca — arrastrá carpetas acá")
         self.lbl_lib.setStyleSheet(f"color:{TEMA['suave']}; font-weight:bold;")
         lib_lay.addWidget(self.lbl_lib)
+        # ---- BUSCADOR + BOTÓN << (contraer todas las carpetas) ----
         self.ed_filtro = QLineEdit()
         self.ed_filtro.setPlaceholderText("Buscar…")
         self.ed_filtro.setClearButtonEnabled(True)
-        lib_lay.addWidget(self.ed_filtro)
+        self.btn_plegar = QPushButton("<<")
+        self.btn_plegar.setFixedSize(34, 28)
+        self.btn_plegar.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_plegar.setStyleSheet("QPushButton { padding:0px; font-size:13px; font-weight:bold; }")
+        self.btn_plegar.setToolTip("Contraer todas las carpetas (activa «Por carpetas» si hace falta)")
+        self.btn_plegar.clicked.connect(self._toggle_plegar_carpetas)
+        fila_busq = QHBoxLayout()
+        fila_busq.setContentsMargins(0, 0, 0, 0)
+        fila_busq.setSpacing(4)
+        fila_busq.addWidget(self.ed_filtro, 1)          # el buscador se estira, el botón no
+        fila_busq.addWidget(self.btn_plegar, 0)         # el botón siempre visible, con ancho fijo
+        lib_lay.addLayout(fila_busq)
+        # -------------------------------------------------------------
         self.biblioteca = Biblioteca()
         self.biblioteca.setStyleSheet(qss_marco("QListWidget", "#2bb5d6", titulo=False))     # el fondo de la lista, con el mismo degradé de color
         lib_lay.addWidget(self.biblioteca, stretch=1)
@@ -264,26 +277,13 @@ class AutoMix(MultibandaMixin, EfectosMixin, LoopMixin, AuricularesMixin, Automa
         self._crear_auriculares()                                # columna 🎧 entre la grabación y el botón Mezclar
         self._t_grab = QTimer(self); self._t_grab.setInterval(250)
         self._t_grab.timeout.connect(self._tic_grabacion)
-        for deck, col in ((self.deck_a, COLOR_DECK_A), (self.deck_b, COLOR_DECK_B)):
-            fila_d = QHBoxLayout(); fila_d.setSpacing(4); fila_d.setContentsMargins(0, 0, 0, 0)
-            fila_d.addWidget(QLabel(f"<b style='color:{col}'>Rejilla {deck.name}</b>"))
-            for txt, tip, fn in (
-                ("÷2", "BPM a la mitad (si el análisis detectó el doble)", lambda _=False, d=deck: self._rejilla(d, factor=0.5)),
-                ("×2", "BPM al doble (si el análisis detectó la mitad)", lambda _=False, d=deck: self._rejilla(d, factor=2.0)),
-                ("①", "Poner el \"1\" del compás en la posición actual (pausá el tema justo en el golpe fuerte con la manito)", lambda _=False, d=deck: self._rejilla(d, uno=True)),
-            ):
-                b = QPushButton(txt); b.setFixedSize(44, 28); b.setToolTip(tip)
-                b.setStyleSheet("QPushButton { padding:0px; font-size:16px; font-weight:bold; }")
-                b.clicked.connect(fn); b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-                fila_d.addWidget(b)
-            fila_d.addStretch(1)
-            self._fila_rej.addLayout(fila_d)
         self.btn_auto_rej = QPushButton("🎯 Auto")
         self.btn_auto_rej.setCheckable(True)
         self.btn_auto_rej.setFixedHeight(28); self.btn_auto_rej.setMinimumWidth(130)
         self.btn_auto_rej.setToolTip("Auto-grilla (verde = activada, rojo = desactivada).\nActivada: revisa sin parar los temas que entran, "
-                                     "corrige el BPM doble/mitad, centra la grilla en los bombos y los empareja (tempo + compases).")
-        self.btn_auto_rej.setChecked(bool(leer_config().get("auto_grilla", False)))
+                                     "corrige el BPM doble/mitad, centra la grilla en los bombos, encuentra solo dónde empieza el compás (el 1) "
+                                     "y los empareja (tempo + compases). Ya no hay nada que ajustar a mano.")
+        self.btn_auto_rej.setChecked(bool(leer_config().get("auto_grilla", True)))
         for _b in (self.btn_auto_rej, self.btn_grabar, self.btn_carpeta_grab):
             _b.setFocusPolicy(Qt.FocusPolicy.NoFocus)         # que la barra espaciadora / Enter nunca los active por accidente
         self._estilo_auto_rej()

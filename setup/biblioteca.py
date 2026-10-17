@@ -3,7 +3,7 @@ from pathlib import Path
 import json
 import os
 import re
-from PySide6.QtWidgets import QAbstractItemView, QListWidget, QListWidgetItem, QStyledItemDelegate
+from PySide6.QtWidgets import QAbstractItemView, QListView, QListWidget, QListWidgetItem, QStyledItemDelegate
 from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter
 from PySide6.QtWidgets import QStyleOptionViewItem
 from PySide6.QtCore import QMimeData, QUrl, Qt, Signal
@@ -19,8 +19,6 @@ from setup.tema import COLOR_DECK_A, COLOR_DECK_B, TEMA
 BIBLIOTECA_JSON = CACHE_DIR / "biblioteca.json"
 
 
-
-
 def _escanear(rutas):
     out = []
     for p in rutas:
@@ -33,8 +31,6 @@ def _escanear(rutas):
         elif os.path.isfile(p) and p.lower().endswith(SUPPORTED):
             out.append(p)
     return out
-
-
 
 
 class _DelegadoFondo(QStyledItemDelegate):
@@ -61,9 +57,7 @@ class _DelegadoFondo(QStyledItemDelegate):
             painter.drawText(option.rect.adjusted(0, 0, -8, 0), int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), der)
             painter.restore()
             return
-        super().paint(painter, option, index)
-
-
+        super().paint(painter, option, index)          # (antes decía `opt`, que solo existe si hay texto a la derecha: sin duración fallaba y la lista no se dibujaba)
 
 
 def _reagrupa(f):
@@ -93,6 +87,7 @@ class Biblioteca(QListWidget):
     nuevos = Signal()          # se agregaron temas: hay que analizarlos
     ROL_NOMBRE = Qt.ItemDataRole.UserRole + 1
     ROL_CAB = Qt.ItemDataRole.UserRole + 2         # True en los encabezados de carpeta
+    ROL_CARPETA_ORIG = Qt.ItemDataRole.UserRole + 4  # ruta ORIGINAL de la carpeta (con mayúsculas reales): para arrastrar afuera
 
     def __init__(self):
         super().__init__()
@@ -103,7 +98,13 @@ class Biblioteca(QListWidget):
         self.setDefaultDropAction(Qt.DropAction.CopyAction)
         self.setUniformItemSizes(True)
         self.setItemDelegate(_DelegadoFondo(self))
-        self.setAlternatingRowColors(True)
+        self.setAlternatingRowColors(False)                                    # todas las filas con el mismo fondo oscuro (#080b14)
+        # ---- auto-ajuste al ancho de la lista (los ítems se estiran con el viewport, sin scroll horizontal) ----
+        self.setResizeMode(QListView.ResizeMode.Adjust)                        # QListWidget hereda de QListView
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setTextElideMode(Qt.TextElideMode.ElideRight)                     # texto largo → "…" (el tooltip lo muestra completo)
+        self.setWordWrap(False)
+        # ----------------------------------------------------------------------------------------------------------
         f = self.font(); f.setPointSize(int(round(9 * FUENTE_BOOST))); self.setFont(f)
         self._rutas = set()
         self._cola = set()         # temas esperando su análisis (se muestran con ⏳)
@@ -111,10 +112,34 @@ class Biblioteca(QListWidget):
         self._memo_frase = {}      # ruta -> True si el tema tiene grilla de compases firme (sirve para mezclar en frase)
         self._memo_dur = {}        # ruta -> duración en segundos (del análisis)
         self._memo_voz = {}        # ruta -> True si el análisis ya trae las curvas de voz/bajo
+        self._skips = {}           # ruta (normalizada) -> True si está SALTEADO (no se carga solo al mezclar)
+        self._cargando = False     # guarda: bloquea reacciones a itemChanged mientras se cargan/ordenan cosas
         self.agrupado = False      # vista por carpetas: un encabezado por carpeta y debajo sus temas
         self._plegadas = set()     # carpetas cerradas (con clic en el encabezado)
         self.itemClicked.connect(self._clic_cab)
+        self.itemChanged.connect(self._on_item_changed)     # checkbox "saltear"
         self._referencia = None    # clave Camelot del tema que suena: los compatibles se pintan de verde
+
+    # ---------- saltear temas ----------
+    def esta_salteado(self, ruta):
+        return self._skips.get(self._clave(ruta), False)
+
+    def todas_activas(self):
+        """Todas las rutas MENOS las que están tildadas como salteadas."""
+        return [r for r in self.todas() if not self.esta_salteado(r)]
+
+    def _on_item_changed(self, it):
+        if self._cargando or self._es_cab(it):
+            return
+        ruta = it.data(Qt.ItemDataRole.UserRole)
+        k = self._clave(ruta)
+        skip = (it.checkState() == Qt.CheckState.Checked)   # ← TILDADO = salteado
+        if self._skips.get(k, False) == skip:
+            return                                   # nada cambió (por ejemplo, disparó por setText/setData)
+        self._skips[k] = skip
+        self._refrescar_textos()
+        self.guardar()
+        self.cambio.emit()
 
     @staticmethod
     def _clave(p):
@@ -153,26 +178,39 @@ class Biblioteca(QListWidget):
 
     def _poner_cab(self):
         """Agrupa por carpeta (en orden alfabético); dentro de cada una los temas conservan el orden que tenían."""
-        items = [self.takeItem(0) for _ in range(self.count())]
-        grupos = {}
-        for it in items:
-            grupos.setdefault(self._carpeta(it.data(Qt.ItemDataRole.UserRole)), []).append(it)
-        for carpeta in sorted(grupos, key=lambda c: os.path.basename(c).lower()):
-            cab = QListWidgetItem()
-            cab.setData(self.ROL_CAB, True)
-            cab.setData(Qt.ItemDataRole.UserRole, carpeta)
-            cab.setFlags(Qt.ItemFlag.ItemIsEnabled)                 # se puede cliquear pero no seleccionar ni cargar
-            f = QFont(self.font()); f.setBold(True); cab.setFont(f)
-            cab.setBackground(QBrush(QColor("#17566a"))); cab.setForeground(QBrush(QColor("#d8f6ff")))
-            self.addItem(cab)
-            cerrada = carpeta in self._plegadas
-            nombre = os.path.basename(carpeta) or carpeta
-            cab.setText(("▶ " if cerrada else "▼ ") + "📁 " + nombre)
-            tot = sum((self.duracion(it.data(Qt.ItemDataRole.UserRole)) or 0) for it in grupos[carpeta])
-            cab.setData(Qt.ItemDataRole.UserRole + 3, f"{len(grupos[carpeta])}" + (f" / {self._fmt_dur(tot, True)}" if tot else ""))
-            for it in grupos[carpeta]:
-                self.addItem(it)
-                it.setHidden(cerrada)
+        prev = self._cargando
+        self._cargando = True
+        try:
+            items = [self.takeItem(0) for _ in range(self.count())]
+            grupos = {}
+            origs = {}                                    # ruta ORIGINAL (con mayúsculas reales) por carpeta
+            for it in items:
+                ruta = it.data(Qt.ItemDataRole.UserRole)
+                k = self._carpeta(ruta)
+                grupos.setdefault(k, []).append(it)
+                if k not in origs:
+                    origs[k] = os.path.dirname(os.path.abspath(ruta))
+            for carpeta in sorted(grupos, key=lambda c: os.path.basename(c).lower()):
+                cab = QListWidgetItem()
+                cab.setData(self.ROL_CAB, True)
+                cab.setData(Qt.ItemDataRole.UserRole, carpeta)
+                cab.setData(self.ROL_CARPETA_ORIG, origs[carpeta])
+                # Seleccionable + arrastrable: para poder arrastrar el título afuera y copiar toda la carpeta
+                cab.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDragEnabled)
+                f = QFont(self.font()); f.setBold(True); cab.setFont(f)
+                cab.setBackground(QBrush(QColor("#17566a"))); cab.setForeground(QBrush(QColor("#d8f6ff")))
+                self.addItem(cab)
+                cerrada = carpeta in self._plegadas
+                nombre = os.path.basename(carpeta) or carpeta
+                cab.setText(("▶ " if cerrada else "▼ ") + "📁 " + nombre)
+                cab.setToolTip(f"{origs[carpeta]}\n\nArrastrá este título para copiar TODA la carpeta afuera (a otra carpeta o al Escritorio).\nClic: abrir / cerrar.")
+                tot = sum((self.duracion(it.data(Qt.ItemDataRole.UserRole)) or 0) for it in grupos[carpeta])
+                cab.setData(Qt.ItemDataRole.UserRole + 3, f"{len(grupos[carpeta])}" + (f" / {self._fmt_dur(tot, True)}" if tot else ""))
+                for it in grupos[carpeta]:
+                    self.addItem(it)
+                    it.setHidden(cerrada)
+        finally:
+            self._cargando = prev
 
     def _clic_cab(self, it):
         if not self._es_cab(it):
@@ -205,6 +243,37 @@ class Biblioteca(QListWidget):
         if getattr(self, "_ult_pintado", None):
             self.pintar(*self._ult_pintado)
 
+    # ---------- botón << (contraer / expandir todas las carpetas) ----------
+    def plegar_todas(self):
+        """Contrae TODAS las carpetas (vista por carpetas)."""
+        if not self.agrupado:
+            return
+        for i in range(self.count()):
+            it = self.item(i)
+            if self._es_cab(it):
+                self._plegadas.add(it.data(Qt.ItemDataRole.UserRole))
+        self._quitar_cab()
+        self._poner_cab()
+
+    def desplegar_todas(self):
+        """Expande TODAS las carpetas (vista por carpetas)."""
+        if not self.agrupado:
+            return
+        self._plegadas.clear()
+        self._quitar_cab()
+        self._poner_cab()
+
+    def todas_plegadas(self):
+        """True si TODAS las carpetas están contraídas (o no hay ninguna carpeta)."""
+        if not self.agrupado:
+            return False
+        carpetas = set()
+        for i in range(self.count()):
+            it = self.item(i)
+            if self._es_cab(it):
+                carpetas.add(it.data(Qt.ItemDataRole.UserRole))
+        return bool(carpetas) and carpetas.issubset(self._plegadas)
+
     @staticmethod
     def _fmt_dur(seg, largo=False):
         seg = int(round(seg)); h, r = divmod(seg, 3600); m, sg = divmod(r, 60)
@@ -219,21 +288,28 @@ class Biblioteca(QListWidget):
         return n if n is not None else it.text()
 
     def _refrescar_textos(self):
-        for i in range(self.count()):
-            it = self.item(i)
-            if self._es_cab(it):
-                continue
-            esperando = self._clave(it.data(Qt.ItemDataRole.UserRole)) in self._cola
-            bpm, clave = self.info(it.data(Qt.ItemDataRole.UserRole))[:2]
-            pref = (f"{bpm:.0f} - " if bpm else "") + (f"[{clave}] " if clave else "")      # ej.: "124 - [8A] nombre del tema"
-            nom = self._nombre(it)
-            if bpm:                                   # el BPM ya va adelante: se saca el "[73 BPM]" que traiga el nombre del archivo
-                nom = re.sub(r"\s*[\[\(]\s*\d+(?:[.,]\d+)?\s*BPM\s*[\]\)]\s*", " ", nom, flags=re.I).strip() or nom
-            nuevo = ("⏳ " if esperando else "") + pref + nom
-            if it.text() != nuevo:
-                it.setText(nuevo)
-            d = self.duracion(it.data(Qt.ItemDataRole.UserRole))
-            it.setData(Qt.ItemDataRole.UserRole + 3, self._fmt_dur(d) if d else None)
+        prev = self._cargando
+        self._cargando = True
+        try:
+            for i in range(self.count()):
+                it = self.item(i)
+                if self._es_cab(it):
+                    continue
+                esperando = self._clave(it.data(Qt.ItemDataRole.UserRole)) in self._cola
+                bpm, clave = self.info(it.data(Qt.ItemDataRole.UserRole))[:2]
+                pref = (f"{bpm:.0f} - " if bpm else "") + (f"[{clave}] " if clave else "")      # ej.: "124 - [8A] nombre del tema"
+                nom = self._nombre(it)
+                if bpm:                                   # el BPM ya va adelante: se saca el "[73 BPM]" que traiga el nombre del archivo
+                    nom = re.sub(r"\s*[\[\(]\s*\d+(?:[.,]\d+)?\s*BPM\s*[\]\)]\s*", " ", nom, flags=re.I).strip() or nom
+                salteado = self.esta_salteado(it.data(Qt.ItemDataRole.UserRole))
+                prefijo = "⏭ " if salteado else ""
+                nuevo = prefijo + ("⏳ " if esperando else "") + pref + nom
+                if it.text() != nuevo:
+                    it.setText(nuevo)
+                d = self.duracion(it.data(Qt.ItemDataRole.UserRole))
+                it.setData(Qt.ItemDataRole.UserRole + 3, self._fmt_dur(d) if d else None)
+        finally:
+            self._cargando = prev
 
     def marcar(self, rutas):
         """Los temas de esta lista aparecen con el reloj de arena hasta que se los analiza."""
@@ -289,7 +365,7 @@ class Biblioteca(QListWidget):
         if n < 2:
             return
         barra = self.verticalScrollBar().value()
-        sel = {self._clave(it.data(Qt.ItemDataRole.UserRole)) for it in self.selectedItems()}
+        sel = {self._clave(it.data(Qt.ItemDataRole.UserRole)) for it in self.selectedItems() if not self._es_cab(it)}
         items = [self.item(i) for i in range(n)]
         datos = []
         for it in items:
@@ -315,6 +391,8 @@ class Biblioteca(QListWidget):
         orden = [d["k"] for d in cadena + resto]
         if orden == [self._clave(self.item(i).data(Qt.ItemDataRole.UserRole)) for i in range(n)]:
             return                                              # ya está en ese orden: no se toca nada
+        prev = self._cargando
+        self._cargando = True
         self.setUpdatesEnabled(False)
         try:
             while self.count() > 0:
@@ -325,6 +403,7 @@ class Biblioteca(QListWidget):
                     d["it"].setSelected(True)
         finally:
             self.setUpdatesEnabled(True)
+            self._cargando = prev
         self.verticalScrollBar().setValue(barra)
         if getattr(self, "_ult_pintado", None):
             self.pintar(*self._ult_pintado)
@@ -343,6 +422,8 @@ class Biblioteca(QListWidget):
         n = 0
         dup = 0
         firmas = self._firmas_actuales()               # lo que ya está en la lista (por nombre + tamaño)
+        prev = self._cargando
+        self._cargando = True
         self.setUpdatesEnabled(False)
         try:
             for p in _escanear(rutas):
@@ -360,10 +441,14 @@ class Biblioteca(QListWidget):
                 it = QListWidgetItem(nombre)
                 it.setData(self.ROL_NOMBRE, nombre)
                 it.setData(Qt.ItemDataRole.UserRole, p)
-                it.setToolTip(p)
+                it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                # ← casilla TILDADA solo si venía guardado como salteado; si no, arranca DESTILDADA
+                it.setCheckState(Qt.CheckState.Checked if self._skips.get(clave) else Qt.CheckState.Unchecked)
+                it.setToolTip(p + "\n\nCasilla tildada = SALTEAR: la carga automática no lo pone en el reproductor.")
                 self.addItem(it)
                 n += 1
         finally:
+            self._cargando = prev
             self.setUpdatesEnabled(True)
         if n and self.agrupado:
             self._quitar_cab(); self._poner_cab()
@@ -377,8 +462,9 @@ class Biblioteca(QListWidget):
         return n
 
     def quitar_seleccion(self):
-        log("biblioteca", f"quitando {len(self.selectedItems())} tema(s)")
-        for it in self.selectedItems():
+        items = [it for it in self.selectedItems() if not self._es_cab(it)]      # nunca borrar los títulos de carpeta
+        log("biblioteca", f"quitando {len(items)} tema(s)")
+        for it in items:
             p = it.data(Qt.ItemDataRole.UserRole)
             self._rutas.discard(os.path.normcase(os.path.abspath(p)))
             self.takeItem(self.row(it))
@@ -417,6 +503,14 @@ class Biblioteca(QListWidget):
     def todas(self):
         return [self.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.count()) if not self._es_cab(self.item(i))]
 
+    def todas_visibles(self):
+        """Todas las rutas VISIBLES ahora mismo en la lista: excluye títulos de carpeta y temas ocultos
+        (por el filtro de búsqueda o por una carpeta cerrada). Es la 'cola' real de lo que el usuario ve.
+        Sirve para que la carga automática (doble clic, mezcla automática, botón F2) respete el filtro."""
+        return [self.item(i).data(Qt.ItemDataRole.UserRole)
+                for i in range(self.count())
+                if not self._es_cab(self.item(i)) and not self.item(i).isHidden()]
+
     def _bpm_de(self, ruta):
         return self.info(ruta)[0]
 
@@ -434,6 +528,8 @@ class Biblioteca(QListWidget):
 
     @_reagrupa
     def ordenar_por_bpm(self):
+        prev = self._cargando
+        self._cargando = True
         self.setUpdatesEnabled(False)
         try:
             items = []
@@ -449,6 +545,7 @@ class Biblioteca(QListWidget):
                 self.addItem(it)
         finally:
             self.setUpdatesEnabled(True)
+            self._cargando = prev
         self._refrescar_textos()
         self.cambio.emit()
 
@@ -460,6 +557,8 @@ class Biblioteca(QListWidget):
             m = re.match(r"\s*(\d{1,2})\s*([ABab])", cam or "")
             kk = (int(m.group(1)), m.group(2).upper()) if m else None
             return (kk is None, kk or (0, ""), bpm is None, bpm or 0.0, self._nombre(it).lower())
+        prev = self._cargando
+        self._cargando = True
         self.setUpdatesEnabled(False)
         try:
             items = []
@@ -471,26 +570,48 @@ class Biblioteca(QListWidget):
                 self.addItem(it)
         finally:
             self.setUpdatesEnabled(True)
+            self._cargando = prev
         self._refrescar_textos()
         self.cambio.emit()
 
     def guardar(self):
         try:
             BIBLIOTECA_JSON.parent.mkdir(exist_ok=True)
-            BIBLIOTECA_JSON.write_text(json.dumps(self.todas(), ensure_ascii=False), encoding="utf-8")
+            datos = [{"ruta": r, "skip": self.esta_salteado(r)} for r in self.todas()]
+            BIBLIOTECA_JSON.write_text(json.dumps(datos, ensure_ascii=False), encoding="utf-8")
         except Exception as e:
             print("No se pudo guardar la biblioteca:", e)
 
     def cargar(self):
         try:
-            rutas = json.loads(BIBLIOTECA_JSON.read_text(encoding="utf-8"))
+            datos = json.loads(BIBLIOTECA_JSON.read_text(encoding="utf-8"))
+            rutas = []
+            self._skips = {}
+            for d in datos:
+                if isinstance(d, str):                       # formato viejo: solo la ruta
+                    rutas.append(d)
+                elif isinstance(d, dict) and d.get("ruta"):
+                    rutas.append(d["ruta"])
+                    if d.get("skip"):
+                        self._skips[os.path.normcase(os.path.abspath(d["ruta"]))] = True
             self.agregar([r for r in rutas if os.path.isfile(r)])
         except Exception:
             pass
 
+    # ---------- drag & drop ----------
     def mimeData(self, items):
+        """Para un tema: la ruta del archivo (como antes). Para un encabezado de carpeta: la ruta ORIGINAL de la
+        carpeta → al soltarla en Explorer se copia la carpeta entera con todo su contenido."""
         md = QMimeData()
-        md.setUrls([QUrl.fromLocalFile(i.data(Qt.ItemDataRole.UserRole)) for i in items])
+        urls = []
+        for i in items:
+            if self._es_cab(i):
+                ruta = i.data(self.ROL_CARPETA_ORIG) or i.data(Qt.ItemDataRole.UserRole)
+            else:
+                ruta = i.data(Qt.ItemDataRole.UserRole)
+            if ruta:
+                urls.append(QUrl.fromLocalFile(ruta))
+        md.setUrls(urls)
         return md
 
     def supportedDropActions(self):

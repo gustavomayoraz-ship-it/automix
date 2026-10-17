@@ -145,9 +145,18 @@ class AutomaticoMixin:
         except Exception:
             return None
 
+    def _hay_filtro_busqueda(self):
+        """True si el usuario tiene algo escrito en el buscador de la lista: la 'cola' pasa a ser
+        solamente lo que se ve en pantalla (temas que coinciden con la búsqueda)."""
+        try:
+            return bool(self.ed_filtro.text().strip())
+        except Exception:
+            return False
+
     def _siguiente_armonico(self, path_actual):
         """Modo estricto: SOLO temas de clave compatible (misma, relativa o vecina) y BPM a ±8 %; el mejor primero,
-        sin repetir los ya tocados. Devuelve (ruta, None) o (None, motivo)."""
+        sin repetir los ya tocados y SALTEANDO los tildados como 'saltear'. Si el buscador tiene algo escrito,
+        solo se consideran los temas visibles en la lista (respeta el filtro). Devuelve (ruta, None) o (None, motivo)."""
         bib = self.biblioteca
         if not path_actual:
             return None, "no hay tema de referencia"
@@ -161,10 +170,14 @@ class AutomaticoMixin:
         bpm0, cam0, _, _ = bib.info(path_actual)
         if cam0 is None or not bpm0:
             return None, "el tema que suena no tiene clave analizada todavía"
+        # ← el filtro del buscador manda: si hay texto, la lista útil es la que el usuario ve
+        candidatas = bib.todas_visibles() if self._hay_filtro_busqueda() else bib.todas()
         def candidatos():
             res = []
-            for orden, r in enumerate(bib.todas()):
+            for orden, r in enumerate(candidatas):
                 if bib._clave(r) in self._tocados or not os.path.isfile(r):
+                    continue
+                if bib.esta_salteado(r):         # ← SALTEADO: no se considera
                     continue
                 bpm, cam, _, _ = bib.info(r)
                 nivel = compat_armonica(cam0, cam)
@@ -184,26 +197,34 @@ class AutomaticoMixin:
         return max(cands, key=lambda c: c[0])[2], None
 
     def _siguiente_en_biblioteca(self, path_actual):
+        """Elige el siguiente tema a cargar. Respeta el filtro de búsqueda de la lista: si el usuario está buscando
+        algo, la 'cola' es lo que ve en pantalla. Los temas tildados con ⏭ (salteados) se ignoran por completo."""
         if getattr(self, "chk_armonico", None) is not None and self.chk_armonico.isChecked():
             try:
                 return self._siguiente_armonico(path_actual)      # estricto: si no hay compatible, no se carga ninguno
             except Exception:
                 import traceback; traceback.print_exc()
-        rutas = self.biblioteca.todas()
+        # ← lista base: si hay filtro, solo lo visible; si no, la lista completa (como antes)
+        todas = self.biblioteca.todas_visibles() if self._hay_filtro_busqueda() else self.biblioteca.todas()
+        activas = [r for r in todas if not self.biblioteca.esta_salteado(r)]
+        if not activas:
+            if self.biblioteca.todas():
+                return None, "todos los temas están salteados (destildá alguno con ⏭)"
+            return None, "biblioteca vacía"
         clave = os.path.normcase(os.path.abspath(path_actual)) if path_actual else None
-        for i, r in enumerate(rutas):
+        for i, r in enumerate(todas):
             if os.path.normcase(os.path.abspath(r)) == clave:
-                for j in range(i + 1, len(rutas)):
-                    if os.path.isfile(rutas[j]):
-                        return rutas[j], None
-                if rutas:
-                    for j in range(len(rutas)):
-                        if os.path.isfile(rutas[j]):
-                            return rutas[j], None
-                return None, "fin de la biblioteca"
-        for r in rutas:
-            if os.path.isfile(r):
-                return r, None
+                for j in range(i + 1, len(todas)):
+                    rr = todas[j]
+                    if os.path.isfile(rr) and not self.biblioteca.esta_salteado(rr):
+                        return rr, None
+                for rr in activas:
+                    if os.path.isfile(rr):
+                        return rr, None
+                return None, "fin de la lista"
+        for rr in activas:
+            if os.path.isfile(rr):
+                return rr, None
         return None, "biblioteca vacía"
 
     def _cargar_siguiente(self, destino):

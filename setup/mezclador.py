@@ -12,18 +12,29 @@ from setup.dsp import AutoMejora, CruceLR4, LimitadorSuave, RealceGrave, TonoAgu
 
 
 class GrabadorMezcla:
-    """Graba a un .wav (16 bits) exactamente lo que sale por los parlantes. El callback de audio solo encola una copia;
-    un hilo aparte escribe en disco, así que grabar no puede producir cortes en el sonido."""
-    def __init__(self, sr=44100):
+    """Graba a un .wav (16 bits) exactamente lo que sale por los parlantes. El callback de audio solo copia el bloque
+    a un buffer PRE-ALOCADO del pool y lo encola; un hilo aparte escribe en disco. NO aloca memoria en el callback."""
+    POOL = 24                     # buffers pre-alocados (24 × 8 KB ≈ 192 KB)
+
+    def __init__(self, sr=44100, blocksize=1024):
         import queue
         self.sr = sr
         self.activo = False
         self.ruta = None
         self.muestras = 0
         self.perdidos = 0
+        self._blocksize = blocksize
         self._q = queue.Queue(maxsize=600)         # ~14 s de margen si el disco se atrasa
         self._hilo = None
         self._error = None
+        self._pool = [np.empty((blocksize, 2), dtype=np.float32) for _ in range(self.POOL)]
+
+    def _nuevo_buffer(self):
+        return self._pool.pop() if self._pool else np.empty((self._blocksize, 2), dtype=np.float32)
+
+    def _devolver_buffer(self, buf):
+        if len(self._pool) < self.POOL and buf.shape == (self._blocksize, 2):
+            self._pool.append(buf)
 
     def iniciar(self, carpeta):
         carpeta = Path(carpeta); carpeta.mkdir(parents=True, exist_ok=True)
@@ -32,15 +43,19 @@ class GrabadorMezcla:
         while not self._q.empty():
             try: self._q.get_nowait()
             except Exception: break
+        # pool limpio (todos los buffers vuelven)
+        self._pool = [np.empty((self._blocksize, 2), dtype=np.float32) for _ in range(self.POOL)]
         archivo = sf.SoundFile(str(self.ruta), mode="w", samplerate=self.sr, channels=2, subtype="PCM_16")
         self._hilo = threading.Thread(target=self._escribir, args=(archivo,), daemon=True)
         self.activo = True
         self._hilo.start()
         return self.ruta
 
-    def escribir(self, bloque):               # lo llama el callback de audio: rápido y sin bloquear
+    def escribir(self, bloque):               # callback de audio: SIN allocations si hay buffer en el pool
         try:
-            self._q.put_nowait(np.array(bloque, dtype=np.float32, copy=True))
+            buf = self._nuevo_buffer()
+            np.copyto(buf, bloque)            # copia sin alocar
+            self._q.put_nowait(buf)
             self.muestras += len(bloque)
         except Exception:
             self.perdidos += len(bloque)
@@ -52,6 +67,7 @@ class GrabadorMezcla:
                 if b is None:
                     break
                 archivo.write(b)
+                self._devolver_buffer(b)      # devuelve al pool: cero alloc en régimen
         except Exception as e:
             self._error = str(e)
             self.activo = False
@@ -73,11 +89,13 @@ class GrabadorMezcla:
         return self.muestras / float(self.sr)
 
 
-
-
 class GlobalMixer:
     F_CRUCE = 150.0           # por debajo = "graves" (bombo y bajo)
     ESPERA_COMPAS_S = 2.5     # (respaldo) espera máxima de la línea de compás si no se conoce el BPM
+
+    # Errores posibles del callback (se muestran en la consola desde el thread de la UI)
+    ERR = {1: "auriculares", 2: "mezclar", 3: "multibanda", 4: "medios", 5: "agudos",
+           6: "golpe 43 Hz", 7: "efectos", 8: "limitador", 9: "recorte"}
 
     def __init__(self, deck_a, deck_b, sr=44100, blocksize=1024):
         self.deck_a = deck_a
@@ -105,7 +123,7 @@ class GlobalMixer:
         self._e = [0.0, 0.0, 0.0]          # energías suavizadas: deck A, deck B y la suma
         self.comp_db = 0.0
         self.vu = (0.0, 0.0, 1.0, 1.0)     # picos L, R (a la salida), ganancia del limitador y del compensador
-        self.grabador = GrabadorMezcla(sr)
+        self.grabador = GrabadorMezcla(sr, blocksize)
         self.aur = Auriculares(sr, blocksize)      # salida de auriculares (PFL)
         self.fx = EfectoSalida(sr)                 # efectos de sonido (sirena, bocina...) que se suman a la mezcla
         self.cortes_audio = 0              # veces que la placa pidió audio y no llegó a tiempo
@@ -118,13 +136,18 @@ class GlobalMixer:
         self._sin_salida_desde = None
         self.aur_perdida = False
 
-    @staticmethod
-    def _rampa(g0, g1, frames):
-        if g0 == g1:
-            return g1
-        return np.linspace(g0, g1, frames, dtype=np.float32)[:, None]
+        # ---- Buffers y rampas PRE-ALOCADOS (el callback nunca debe allocar) ----
+        self._err_flag = 0                 # 0 = sin error; >0 = código de error (se resetea al leerlo)
+        self._rms_n = 0                    # contador para calcular el RMS cada N bloques
+        self._vu_n = 0                     # idem para el VU
+        self._ramp01 = np.linspace(0.0, 1.0, blocksize, dtype=np.float32)   # rampa lineal fija
+        self._ramp1d = np.empty(blocksize, dtype=np.float32)                # rampa temporal (se reusa)
+        self._scratch_1mr = np.empty(blocksize, dtype=np.float32)           # 1 - ramp (para crossfade MB)
+        self._scratch_mix = np.empty((blocksize, 2), dtype=np.float32)      # mix * (1-r)
+        self._scratch_proc = np.empty((blocksize, 2), dtype=np.float32)     # proc * r
 
-    def _db_muestras(self, deck):
+    @staticmethod
+    def _db_muestras(deck):
         an = deck.analysis
         if not an:
             return None
@@ -164,7 +187,7 @@ class GlobalMixer:
         sale = self.deck_a if a1 < a0 else (self.deck_b if b1 < b0 else None)
         if sale is None:                                   # los dos suben (p. ej. un deck se detuvo): rampa suave
             g["a_lo"], g["b_lo"] = a1, b1
-            return self._rampa(a0, a1, frames), self._rampa(b0, b1, frames)
+            return self._rampa_2d(a0, a1, frames), self._rampa_2d(b0, b1, frames)
         p0 = pa if sale is self.deck_a else pb
         k = self._offset_compas(sale, p0, frames)
         if k is None:
@@ -181,6 +204,14 @@ class GlobalMixer:
         k = 0 if k < 0 else max(0, k - r)                  # la rampa TERMINA en la línea de compás: el bombo nuevo cae entero
         g["a_lo"], g["b_lo"] = a1, b1                      # el traspaso queda hecho en este bloque
         return self._vec_paso(a0, a1, k, r, frames), self._vec_paso(b0, b1, k, r, frames)
+
+    def _rampa_2d(self, g0, g1, frames):
+        """Rampa con `frames` muestras, forma (frames,1), REUSANDO `_ramp1d` (sin allocar)."""
+        if g0 == g1:
+            return g1
+        np.multiply(self._ramp01[:frames], g1 - g0, out=self._ramp1d[:frames])
+        np.add(self._ramp1d[:frames], g0, out=self._ramp1d[:frames])
+        return self._ramp1d[:frames, None]
 
     TAU_E = 0.35        # ventana de energía (s)
     TAU_ATK = 0.30      # cuánto tarda en bajar la suma cuando suenan los dos (s)
@@ -205,7 +236,11 @@ class GlobalMixer:
         self.comp_db = 20.0 * math.log10(max(1e-3, c1))
         if abs(c1 - 1.0) < 1e-4 and abs(c0 - 1.0) < 1e-4:
             return mix
-        return mix * np.linspace(c0, c1, frames, dtype=np.float32)[:, None]
+        # multiplicate SIN allocar: ganancia lineal de c0 a c1 sobre la mezcla
+        np.multiply(self._ramp01[:frames], c1 - c0, out=self._ramp1d[:frames])
+        np.add(self._ramp1d[:frames], c0, out=self._ramp1d[:frames])
+        np.multiply(mix, self._ramp1d[:frames, None], out=mix)
+        return mix
 
     def _mezclar(self, a, b, frames, pa, pb):
         da, db = self.deck_a, self.deck_b
@@ -217,11 +252,11 @@ class GlobalMixer:
             alo, ahi = self._xo_a.split(a)
             blo, bhi = self._xo_b.split(b)
             ga_lo, gb_lo = self._ganancias_bajos(tg, frames, pa, pb)
-            p_a = alo * ga_lo + ahi * self._rampa(g["a_hi"], tg["a_hi"], frames)
-            p_b = blo * gb_lo + bhi * self._rampa(g["b_hi"], tg["b_hi"], frames)
+            p_a = alo * ga_lo + ahi * self._rampa_2d(g["a_hi"], tg["a_hi"], frames)
+            p_b = blo * gb_lo + bhi * self._rampa_2d(g["b_hi"], tg["b_hi"], frames)
         else:
-            p_a = a * self._rampa(g["a_hi"], tg["a_hi"], frames)
-            p_b = b * self._rampa(g["b_hi"], tg["b_hi"], frames)
+            p_a = a * self._rampa_2d(g["a_hi"], tg["a_hi"], frames)
+            p_b = b * self._rampa_2d(g["b_hi"], tg["b_hi"], frames)
             g["a_lo"], g["b_lo"] = tg["a_hi"], tg["b_hi"]
         g["a_hi"], g["b_hi"] = tg["a_hi"], tg["b_hi"]
         mix = p_a + p_b
@@ -270,8 +305,6 @@ class GlobalMixer:
                 muerto = True
             ahora = time.monotonic()
             if not muerto and ahora - getattr(self, "_t_pres", 0) >= 1.0:
-                # Windows a veces mueve solo un stream al dispositivo predeterminado cuando su aparato desaparece: el
-                # stream sigue "vivo" pero suena por donde no debe. Por eso se mira si el aparato sigue conectado.
                 self._t_pres = ahora
                 self._no_pres = 0 if self.aur.sigue_presente() else getattr(self, "_no_pres", 0) + 1
                 muerto = self._no_pres >= 2
@@ -296,14 +329,13 @@ class GlobalMixer:
             except Exception:
                 muerto = True
             if not muerto and ahora - t > 1.5:
-                muerto = True                       # el callback dejó de llamarse
+                muerto = True
         if muerto:
             self._recuperando = True
             threading.Thread(target=self._recuperar, daemon=True).start()
 
     def _recuperar(self):
-        """Cierra lo que quedó colgado, reinicia PortAudio y abre la salida predeterminada actual. Si todavía no hay
-        ninguna, reintenta cada segundo (el sonido de los decks no avanza mientras tanto, así que sigue donde estaba)."""
+        """Cierra lo que quedó colgado, reinicia PortAudio y abre la salida predeterminada actual."""
         try:
             if self._sin_salida_desde is None:
                 self._sin_salida_desde = time.monotonic()
@@ -326,7 +358,7 @@ class GlobalMixer:
                 self.stream = None
                 print(f"[audio] sin salida disponible todavía ({e})")
                 time.sleep(1.0)
-                return                              # el vigilante vuelve a llamar y reintenta
+                return
             self._sin_salida_desde = None
             self._aviso_salida = f"🔊 La salida de audio se desconectó: ahora suena por {self.nombre_salida()}"
         finally:
@@ -335,7 +367,7 @@ class GlobalMixer:
     def reiniciar_audio(self):
         """PortAudio solo lista los dispositivos al iniciar: los que se enchufaron o conectaron (Bluetooth) después no
         aparecen. Esto cierra todo, vuelve a leer los dispositivos y reabre la salida principal en el MISMO dispositivo
-        de antes (aunque Windows haya cambiado el predeterminado). Corta el sonido un instante."""
+        de antes (aunque Windows haya cambiado el predeterminado)."""
         nombre = api = None
         try:
             if self.stream is not None:
@@ -374,31 +406,54 @@ class GlobalMixer:
             try: s.close()
             except Exception: pass
 
+    # ------------------------------------------------------------------
+    # CALLBACK DE AUDIO — sin allocaciones en régimen (Fase 1)
+    # Reglas: NADA de print/traceback, NADA de np.linspace/np.zeros/np.array de tamaño variable,
+    # usar out= donde se pueda, VU/RMS cada N bloques, errores por bandera.
+    # ------------------------------------------------------------------
     def _cb(self, outdata, frames, time_info, status):
         self._cb_n += 1
         if status and getattr(status, "output_underflow", False):
-            self.cortes_audio += 1                      # la salida se quedó sin audio a tiempo (se oye como trancada)
+            self.cortes_audio += 1
         t_cb0 = time.perf_counter()
-        pa = self.deck_a.cursor + self.deck_a._cursor_frac + self.deck_a.loop_desfase          # posición al INICIO del bloque (para caer en el compás)
-        pb = self.deck_b.cursor + self.deck_b._cursor_frac + self.deck_b.loop_desfase
-        a = self.deck_a.render(frames)
-        b = self.deck_b.render(frames)
-        self.snap_pos = (self.deck_a.cursor + self.deck_a._cursor_frac + self.deck_a.loop_desfase,
-                         self.deck_b.cursor + self.deck_b._cursor_frac + self.deck_b.loop_desfase)
+
+        da, db = self.deck_a, self.deck_b
+        pa = da.cursor + da._cursor_frac + da.loop_desfase
+        pb = db.cursor + db._cursor_frac + db.loop_desfase
+        a = da.render(frames)
+        b = db.render(frames)
+        self.snap_pos = (da.cursor + da._cursor_frac + da.loop_desfase,
+                         db.cursor + db._cursor_frac + db.loop_desfase)
+
         try:
             self.aur.alimentar(a, b)
         except Exception:
-            pass
-        mix = self._mezclar(a, b, frames, pa, pb)
+            if self._err_flag == 0: self._err_flag = 1
+
+        try:
+            mix = self._mezclar(a, b, frames, pa, pb)
+        except Exception:
+            if self._err_flag == 0: self._err_flag = 2
+            outdata.fill(0)
+            return
+
+        # Multibanda con fundido cruzado a/desde el original
         w1 = 1.0 if self.mb_activo else 0.0
         if w1 > 0.0 or self._mb_wet > 0.0:
             try:
                 proc = self.mb.procesar(mix)
                 w0 = self._mb_wet
                 if w0 != w1:
-                    r = np.linspace(w0, w1, frames, dtype=np.float32)[:, None]
+                    # ramp = ramp01 * (w1-w0) + w0
+                    np.multiply(self._ramp01[:frames], w1 - w0, out=self._ramp1d[:frames])
+                    np.add(self._ramp1d[:frames], w0, out=self._ramp1d[:frames])
+                    # 1 - ramp
+                    np.subtract(1.0, self._ramp1d[:frames], out=self._scratch_1mr[:frames])
+                    # mix = mix*(1-r) + proc*r
+                    np.multiply(mix, self._scratch_1mr[:frames, None], out=self._scratch_mix[:frames])
+                    np.multiply(proc, self._ramp1d[:frames, None], out=self._scratch_proc[:frames])
+                    np.add(self._scratch_mix[:frames], self._scratch_proc[:frames], out=mix)
                     self._mb_wet = w1
-                    mix = mix * (1.0 - r) + proc * r
                 else:
                     mix = proc
                 if w1 == 0.0:
@@ -406,43 +461,86 @@ class GlobalMixer:
             except Exception:
                 self.mb_activo = False
                 self._mb_wet = 0.0
-                import traceback; traceback.print_exc()
+                if self._err_flag == 0: self._err_flag = 3
+
         try:
             mix = self.medios.procesar(mix)
         except Exception:
             self.medios.db = 0.0
-            import traceback; traceback.print_exc()
+            if self._err_flag == 0: self._err_flag = 4
         try:
             mix = self.agudos.procesar(mix)
         except Exception:
             self.agudos.db = 0.0
-            import traceback; traceback.print_exc()
+            if self._err_flag == 0: self._err_flag = 5
         try:
             mix = self.golpe.procesar(mix)
         except Exception:
             self.golpe.cantidad = 0.0
-            import traceback; traceback.print_exc()
-        if self.fx.buf is not None:                # el efecto entra antes del limitador: nunca se pasa de nivel
-            mix = self.fx.sumar(mix)
-        mix = self.limitador.procesar(mix)
+            if self._err_flag == 0: self._err_flag = 6
+
+        if self.fx.buf is not None:
+            try:
+                mix = self.fx.sumar(mix)
+            except Exception:
+                self.fx.detener()
+                if self._err_flag == 0: self._err_flag = 7
+
         try:
-            self.nivel_vis = float(np.sqrt(np.mean(mix * mix)))
+            mix = self.limitador.procesar(mix)
         except Exception:
-            self.nivel_vis = 0.0
-        pico = np.abs(mix)                       # red de seguridad (casi nunca actúa): recorte suave solo si algo se escapó
-        if pico.size and float(pico.max()) > 0.98:
-            mix = np.tanh(mix * 1.0).astype(np.float32) if float(pico.max()) > 1.5 else np.clip(mix, -0.99, 0.99)
+            if self._err_flag == 0: self._err_flag = 8
+
+        # RMS cada N bloques (la UI no necesita más de ~4 Hz)
+        self._rms_n += 1
+        if self._rms_n >= 10:
+            self._rms_n = 0
+            try:
+                v = mix.ravel()
+                self.nivel_vis = float(np.sqrt(np.dot(v, v) / v.size))
+            except Exception:
+                self.nivel_vis = 0.0
+
+        # Red de seguridad: peak sin allocar (min/max C-level)
+        try:
+            mn = float(mix.min()); mx = float(mix.max())
+            peak = mx if mx > -mn else -mn
+        except Exception:
+            peak = 0.0
+        if peak > 0.98:
+            try:
+                if peak > 1.5:
+                    np.tanh(mix, out=mix)
+                else:
+                    np.clip(mix, -0.99, 0.99, out=mix)
+            except Exception:
+                if self._err_flag == 0: self._err_flag = 9
+
+        # Volumen general (con rampa si cambió, sin allocar)
         g0, g1 = self._gain_act, self.gain_obj
         if g0 != g1:
-            mix = mix * np.linspace(g0, g1, frames, dtype=np.float32)[:, None]
+            np.multiply(self._ramp01[:frames], g1 - g0, out=self._ramp1d[:frames])
+            np.add(self._ramp1d[:frames], g0, out=self._ramp1d[:frames])
+            np.multiply(mix, self._ramp1d[:frames, None], out=mix)
             self._gain_act = g1
         elif g1 != 1.0:
-            mix = mix * g1
-        try:
-            self.vu = (float(np.abs(mix[:, 0]).max()), float(np.abs(mix[:, 1]).max()), float(self.limitador.g), float(self._comp))
-        except Exception:
-            pass
-        outdata[:] = mix.astype(np.float32)
+            np.multiply(mix, g1, out=mix)
+
+        # VU cada N bloques (33 ms del timer son ~3 bloques)
+        self._vu_n += 1
+        if self._vu_n >= 3:
+            self._vu_n = 0
+            try:
+                ch_l = mix[:, 0]; ch_r = mix[:, 1]
+                pl = float(ch_l.max()); nl = float(ch_l.min())
+                pr = float(ch_r.max()); nr = float(ch_r.min())
+                pl = pl if pl > -nl else -nl
+                pr = pr if pr > -nr else -nr
+                self.vu = (pl, pr, float(self.limitador.g), float(self._comp))
+            except Exception:
+                pass
+
+        outdata[:] = mix
         dt_cb = (time.perf_counter() - t_cb0) * 1000.0
         if dt_cb > self.cb_max_ms:
             self.cb_max_ms = dt_cb

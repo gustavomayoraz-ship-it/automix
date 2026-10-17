@@ -1,35 +1,13 @@
-"""AutoMix — rejilla: edición manual y Auto-grilla."""
+"""AutoMix — rejilla: todo automático (octava, desfase sobre los bombos y el "1" del compás)."""
 from pathlib import Path
-from setup.ajustes import fmt_time
-from setup.analisis import _guardar_cache, plegar_bpm
+from setup.analisis import UNO_CONF_MIN, _guardar_cache, plegar_bpm
 from setup.base import CACHE_DIR, log
 from setup.config import guardar_config
 
 
 class RejillaMixin:
-    """Rejilla: edición manual y Auto-grilla (parte de la ventana principal)."""
+    """Auto-grilla (parte de la ventana principal). Ya no hay botones ÷2 / ×2 / ① ni arrastre a mano."""
 
-
-    def _rejilla(self, deck, factor=1.0, uno=False):
-        if not deck.analysis:
-            self._set_status(f"⚠️ Deck {deck.name}: no hay un tema analizado")
-            return
-        t_uno = None
-        if uno:
-            t_uno = (deck.cursor + deck._cursor_frac) / float(deck.sr)
-            try:                                  # sonando: lo que se oye va atrás de la posición por la latencia de la salida
-                if deck.playing and self.mixer.stream is not None:
-                    t_uno -= float(self.mixer.stream.latency) * max(1e-6, deck.rate_eff)
-            except Exception:
-                pass
-            t_uno = max(0.0, t_uno)
-        deck.motivo_rechazo = None
-        if deck.corregir_rejilla(factor=factor, uno_en=t_uno, usuario=True):
-            msg = ("BPM ×2" if factor == 2.0 else "BPM ÷2") if not uno else f"el 1 queda en {fmt_time(t_uno)}"
-            log(f"deck {deck.name}", f"rejilla: {msg} → {deck.analysis['bpm']:.2f} BPM")
-            self._set_status(f"🎯 Deck {deck.name}: {msg} · {deck.analysis['bpm']:.1f} BPM (guardado)")
-        elif getattr(deck, "motivo_rechazo", None):
-            self._set_status(f"⚠️ Deck {deck.name}: no se cambió, {deck.motivo_rechazo}")
 
     def _estilo_auto_rej(self):
         on = self.btn_auto_rej.isChecked()
@@ -67,7 +45,8 @@ class RejillaMixin:
 
     def _auto_rejilla(self, forzar=False):
         """Botón 🎯 Auto. Para los dos temas cargados: (1) corrige el BPM doble/mitad respecto del otro, (2) centra la grilla
-        sobre los bombos, (3) empareja tempo y compases (si los dos suenan). Siempre cuenta en pantalla qué encontró."""
+        sobre los bombos, (3) informa qué tan seguro está el "1" del compás, (4) empareja tempo y compases (si los dos suenan).
+        Siempre cuenta en pantalla qué encontró."""
         a, b = self.deck_a, self.deck_b
         cargados = [d for d in (a, b) if d.analysis and d.original_bpm]
         if not cargados:
@@ -78,7 +57,7 @@ class RejillaMixin:
         partes = []
         cambio = False                      # ¿se movió alguna grilla? (solo entonces hace falta volver a emparejar)
         for d in cargados:                  # 0) un BPM absurdo (fuera de 50-220) se lleva primero al rango musical
-            if not d.playing and not d.analysis.get("usuario") and plegar_bpm(d.analysis):
+            if not d.playing and plegar_bpm(d.analysis):
                 d.original_bpm = d.analysis["bpm"]; d._db_cache = None; d._update_bpm_label()
                 try:
                     _guardar_cache(CACHE_DIR / (Path(d.path).stem + ".json"), d.analysis)
@@ -99,16 +78,14 @@ class RejillaMixin:
                         clave = (round(r, 3), 0 if 70.0 <= bpm * f <= 180.0 else 1)
                         if mejor is None or clave < mejor[0]:
                             mejor = (clave, deck, f, r)
-                if mejor and mejor[3] < 1.12 and mejor[3] < max(ba, bb) / min(ba, bb) * 0.8 and not mejor[1].analysis.get("usuario"):
+                if mejor and mejor[3] < 1.12 and mejor[3] < max(ba, bb) / min(ba, bb) * 0.8:
                     _, deck, f, r = mejor
                     if deck.corregir_rejilla(factor=f, avisar=False):
                         cambio = True
                         partes.append(f"Deck {deck.name}: BPM {'×2' if f == 2.0 else '÷2'} → {deck.analysis['bpm']:.1f}")
         # 2) grilla centrada en los bombos
         for d in cargados:
-            if d.analysis.get("usuario"):
-                partes.append(f"Deck {d.name}: grilla corregida por vos, no se toca")
-                continue
+            d.analysis.pop("usuario", None)            # restos de correcciones a mano de versiones anteriores
             if d.playing:                                     # a un tema que suena no se le mueve la grilla: se oiría un salto
                 partes.append(f"Deck {d.name}: está sonando, grilla sin tocar")
                 continue
@@ -121,9 +98,17 @@ class RejillaMixin:
                 partes.append(f"Deck {d.name}: grilla ya centrada en los bombos")
             else:
                 partes.append(f"Deck {d.name}: grilla corrida {ms:+.0f} ms sobre los bombos")
+        for d in cargados:                                # 3) el "1" del compás (se calcula solo con el análisis)
+            conf = d.analysis.get("uno_conf")
+            if not d.analysis.get("uno_auto") or conf is None:
+                partes.append(f"Deck {d.name}: calculando el 1…")
+            elif conf >= UNO_CONF_MIN:
+                partes.append(f"Deck {d.name}: el 1 seguro")
+            else:
+                partes.append(f"Deck {d.name}: el 1 dudoso (poco acento en la música)")
         if cambio:
             self.timeline.redraw()
-        # 3) emparejar
+        # 4) emparejar
         if len(cargados) == 2:
             ba, bb = float(a.original_bpm), float(b.original_bpm)
             if not self._bpm_compatibles():

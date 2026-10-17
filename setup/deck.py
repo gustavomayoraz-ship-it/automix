@@ -9,9 +9,10 @@ from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import QFileDialog, QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout
 from PySide6.QtCore import QPoint, QTimer, Qt
 from setup.ajustes import NIVEL_V2, SUPPORTED, TARGET_LUFS_RMS, fmt_time
-from setup.analisis import _guardar_cache, _limpiar_grilla_cache, _mantener_vivo, desfase_rejilla_bombos, desplazar_rejilla, grilla_manual, load_audio_stereo, plegar_bpm
+from setup.analisis import (_guardar_cache, _limpiar_grilla_cache, _mantener_vivo, aplicar_uno, desfase_rejilla_auto,
+                            desfase_rejilla_bombos, desplazar_rejilla, grilla_manual, load_audio_stereo, plegar_bpm)
 from setup.base import CACHE_DIR, _log_diferido, log
-from setup.hilos_analisis import Analyzer
+from setup.hilos_analisis import Analyzer, RehacerUno
 from setup.tema import TEMA, _rgba
 from setup.widgets import EtiquetaTema, RelojReset
 from setup.wsola import WsolaFlujo
@@ -49,6 +50,7 @@ class Deck(QFrame):
         self._fi_pend = False          # el próximo bloque empieza con un fundido de entrada (después de un salto)
         self._fi_pos = 0               # cuánto del fundido de entrada ya se aplicó
         self._ws_fi_pos = 128          # ídem, para la entrada suave del estirado (128 = terminado)
+        self._auto_centrado_sesion = False   # ya se intentó el auto-centrado para la carga actual
 
         self.setAcceptDrops(True)
         self._acento = color
@@ -180,6 +182,7 @@ class Deck(QFrame):
         self.auto_gain = 1.0
         self._ag_listo = False
         self._db_cache = None
+        self._auto_centrado_sesion = False
         self.tempo_rate = 1.0
         self.tempo_manual = False
         self.pos_manual = False
@@ -195,6 +198,7 @@ class Deck(QFrame):
     def load_track(self, path):
         self.stop()
         self.pos_manual = False
+        self._auto_centrado_sesion = False        # nuevo tema → nueva oportunidad de auto-centrar
         with self.lock:
             self.audio = None
             self.cursor = 0
@@ -212,6 +216,7 @@ class Deck(QFrame):
         self.analyzer = Analyzer(path)
         _mantener_vivo(self.analyzer)
         self.analyzer.done.connect(self._on_analysis)
+        self.analyzer.uno_listo.connect(self._uno_de_cache)
         self.analyzer.start()
         threading.Thread(target=self._load_audio, args=(path,), daemon=True).start()
 
@@ -221,6 +226,7 @@ class Deck(QFrame):
             # TODO lo pesado (copia contigua, Auto-Gain) FUERA del lock: el lock del deck lo toma
             # también el callback de audio, y si se queda esperando se oye un corte en lo que suena.
             y32 = np.ascontiguousarray(y, dtype=np.float32)
+            y32, recorte = self._recortar_silencio_final(y32, sr)
             ag = self._calc_auto_gain(y32)
             with self.lock:
                 if path != self.path:
@@ -231,9 +237,44 @@ class Deck(QFrame):
                 self.sr = sr
                 self.cursor = 0
                 self._cursor_frac = 0.0
+                if self.analysis:                                  # el análisis llegó antes que el audio
+                    self.analysis["duration"] = min(float(self.analysis.get("duration") or 0) or len(y32) / sr, len(y32) / sr) if recorte else self.analysis.get("duration")
+            if recorte:
+                log(f"deck {self.name}", f"silencio final recortado: {recorte:.1f} s")
             log(f"deck {self.name}", f"audio listo: {len(y32) / sr:.1f} s · {sr} Hz · auto-gain x{ag:.2f} · {os.path.basename(path)}")
         except Exception as e:
             print("Error cargando audio:", e)
+
+    SILENCIO_FIN_DB = -50.0      # por debajo de esto (RMS en ventanas de 50 ms) se considera silencio
+    SILENCIO_FIN_MIN_S = 1.0     # solo se recorta si el silencio final dura al menos esto
+    SILENCIO_FIN_COLA_S = 0.25   # se deja esta cola después del último sonido (que no suene cortado)
+
+    @classmethod
+    def _recortar_silencio_final(cls, audio, sr):
+        """Quita el silencio del final del tema. Devuelve (audio, segundos_recortados). Solo mira el audio ya cargado:
+        funciona igual con temas en caché y no toca el archivo original."""
+        try:
+            v = max(256, int(sr * 0.05))
+            n = len(audio) // v
+            if n < 40:
+                return audio, 0.0
+            bl = audio[:n * v].reshape(n, v, -1)
+            rms = np.sqrt(np.einsum("bij,bij->b", bl, bl, dtype=np.float64) / (v * bl.shape[2]))
+            vivo = np.nonzero(rms > 10.0 ** (cls.SILENCIO_FIN_DB / 20.0))[0]
+            if len(vivo) == 0:
+                return audio, 0.0
+            fin = int((vivo[-1] + 1) * v + cls.SILENCIO_FIN_COLA_S * sr)
+            fin = max(fin, int(5.0 * sr))
+            sobra = (len(audio) - fin) / float(sr)
+            if sobra < cls.SILENCIO_FIN_MIN_S or fin >= len(audio):
+                return audio, 0.0
+            out = np.ascontiguousarray(audio[:fin])
+            k = min(len(out), int(0.03 * sr))                      # fundido de 30 ms: sin clic en el corte
+            if k > 1:
+                out[-k:] *= np.linspace(1.0, 0.0, k, dtype=np.float32)[:, None]
+            return out, sobra
+        except Exception:
+            return audio, 0.0
 
     @staticmethod
     def _calc_auto_gain(audio):
@@ -242,7 +283,6 @@ class Deck(QFrame):
             n = (len(audio) // 1024) * 1024
             if n < 2048:
                 return 1.0
-            # media L/R por bloques de 1024, sin copias gigantes de float64
             bloques = audio[:n].reshape(-1, 1024, 2)
             e = np.einsum("bij,bij->b", bloques, bloques, dtype=np.float64) / (1024 * 2)
             rms_medio = float(np.mean(np.sqrt(e)))
@@ -253,8 +293,7 @@ class Deck(QFrame):
     @staticmethod
     def _afinar_bpm(res):
         """El BPM global de librosa suele errar 1-2 %. Con la grilla de beats detectada se calcula uno
-        mucho más preciso (media de los intervalos sin los atípicos). Un error de 1 % en el BPM
-        hace que, en una mezcla de 10 s, los golpes se corran ~100 ms y se oiga doble (flam)."""
+        mucho más preciso (media de los intervalos sin los atípicos)."""
         try:
             b = np.asarray(res.get("beats_full") or [], dtype=np.float64)
             if len(b) < 16:
@@ -286,6 +325,10 @@ class Deck(QFrame):
             except Exception:
                 pass
         self.analysis = res
+        if self.audio is not None and self.sr:                 # audio ya recortado: la duración útil manda
+            d_audio = len(self.audio) / float(self.sr)
+            if 0 < d_audio < float(res.get("duration") or 0) - 0.5:
+                res["duration"] = d_audio
         self.original_bpm = res["bpm"]
         if not getattr(self, "_ag_listo", False):
             self.auto_gain = res.get("auto_gain", 1.0)
@@ -293,12 +336,50 @@ class Deck(QFrame):
         self.lbl_time.setText(f"00:00 / {fmt_time(res['duration'])}")
         if self.on_analysis_cb:
             self.on_analysis_cb(self.name, res)
+        # Auto-centrado de la grilla: se hace acá, deferido, para no tocar nada mientras la UI se está armando
+        QTimer.singleShot(200, self._auto_centrar)
+
+    def _auto_centrar(self):
+        """Auto-centra la grilla en los bombos al cargar un tema (sin que el usuario tenga que hacer nada).
+        Mide con `desfase_rejilla_auto` (bombos → fallback RMS) y aplica el corrimiento si es razonable.
+        La grilla ya no se corrige a mano: el cálculo automático es la única fuente."""
+        if not self.analysis or not self.path:
+            return
+        if getattr(self, "_auto_centrado_sesion", False):
+            return
+        self._auto_centrado_sesion = True
+        self.analysis.pop("usuario", None)               # restos de correcciones a mano de versiones anteriores
+        try:
+            off = desfase_rejilla_auto(self.analysis)
+        except Exception:
+            import traceback; traceback.print_exc()
+            return
+        if off is None:
+            log(f"deck {self.name}", "grilla auto: no se pudo medir (bombos y energía RMS poco claros), queda como está")
+            return
+        if abs(off) < 0.008:
+            log(f"deck {self.name}", "grilla auto: ya estaba centrada (±8 ms)")
+            return
+        if abs(off) > 0.15:
+            log(f"deck {self.name}", f"grilla auto: corrimiento {off*1000:+.0f} ms sospechoso (¿BPM doble/mitad?), no se aplica")
+            return
+        try:
+            with self.lock:
+                desplazar_rejilla(self.analysis, off)
+                self._db_cache = None
+            _guardar_cache(CACHE_DIR / (Path(self.path).stem + ".json"), self.analysis)
+            log(f"deck {self.name}", f"grilla auto: corrida {off*1000:+.0f} ms sobre los bombos")
+            if self.on_analysis_cb:
+                self.on_analysis_cb(self.name, self.analysis)
+        except Exception:
+            import traceback; traceback.print_exc()
 
     def centrar_rejilla(self, avisar=True):
-        """Mueve la grilla para que los tiempos caigan sobre los bombos. Devuelve el corrimiento en ms (None = no se pudo medir)."""
+        """Mueve la grilla para que los tiempos caigan sobre los bombos (o RMS si no hay kick).
+        Devuelve el corrimiento en ms (None = no se pudo medir, 0.0 = ya estaba centrada)."""
         if not self.analysis or not self.path:
             return None
-        off = desfase_rejilla_bombos(self.analysis)
+        off = desfase_rejilla_auto(self.analysis)
         if off is None:
             return None
         if abs(off) < 0.008:                              # ya está bien centrada (menos de 8 ms)
@@ -315,7 +396,8 @@ class Deck(QFrame):
         return off * 1000.0
 
     def corregir_rejilla(self, factor=1.0, uno_en=None, usuario=False, avisar=True):
-        """Botones ÷2 / ×2 / ①. Cambia la grilla del tema cargado, la guarda en su caché y avisa a la ventana."""
+        """Cambia la grilla del tema cargado (la usa el modo Auto: octava ×2 / ÷2), la guarda en su caché y avisa a la ventana.
+        Si cambió la octava, el "1" del compás se vuelve a buscar solo."""
         if not self.analysis or not self.path:
             return False
         try:
@@ -336,10 +418,56 @@ class Deck(QFrame):
                 import traceback; traceback.print_exc()
             if avisar and self.on_analysis_cb:
                 self.on_analysis_cb(self.name, self.analysis)
+            if factor and factor != 1.0:
+                self._rehacer_uno()
             return True
         except Exception:
             import traceback; traceback.print_exc()
             return False
+
+    def _rehacer_uno(self):
+        """La grilla cambió de octava: el compás tiene otro largo, así que el "1" se busca de nuevo (en segundo plano)."""
+        if not self.analysis or not self.path:
+            return
+        self.analysis.pop("uno_auto", None)
+        h = RehacerUno(self.path, self.analysis.get("beats_full") or [])
+        h.listo.connect(self._uno_rehecho)
+        _mantener_vivo(h)
+        h.start()
+
+    def _uno_de_cache(self, path, res):
+        """Un análisis guardado antes del "1" automático: llega el "1" (y los bombos) calculado en segundo plano."""
+        if path != self.path or not self.analysis or not res:
+            return
+        if res.get("kicks") and not self.analysis.get("kicks_full"):
+            self.analysis["kicks_full"] = res["kicks"]
+            self.analysis["kicks"] = res["kicks"][::len(res["kicks"]) // 400 + 1]
+        r = res.get("uno")
+        if r and not self.playing:                       # sonando no se toca: se oiría un salto
+            with self.lock:
+                aplicar_uno(self.analysis, r[0], r[1])
+                self._db_cache = None
+            log(f"deck {self.name}", f"el 1 calculado en segundo plano · confianza {r[1]:.2f}")
+            if self.on_analysis_cb:
+                self.on_analysis_cb(self.name, self.analysis)
+        try:
+            _guardar_cache(CACHE_DIR / (Path(self.path).stem + ".json"), self.analysis)
+        except Exception:
+            import traceback; traceback.print_exc()
+
+    def _uno_rehecho(self, path, r):
+        if path != self.path or not self.analysis or not r or self.playing:   # sonando no se toca: se oiría un salto
+            return
+        with self.lock:
+            aplicar_uno(self.analysis, r[0], r[1])
+            self._db_cache = None
+        try:
+            _guardar_cache(CACHE_DIR / (Path(self.path).stem + ".json"), self.analysis)
+        except Exception:
+            import traceback; traceback.print_exc()
+        log(f"deck {self.name}", f"el 1 recalculado tras cambiar la octava · confianza {r[1]:.2f}")
+        if self.on_analysis_cb:
+            self.on_analysis_cb(self.name, self.analysis)
 
     def _update_bpm_label(self):
         if self.original_bpm is None:
@@ -379,7 +507,7 @@ class Deck(QFrame):
             self._ws_activo = False
             self.loop = None; self.loop_desfase = 0.0; self._loop_salir = False
 
-    RESET_SUAVE_S = 3.0          # el botón Reset vuelve al 100 % progresivamente (si el tema está sonando)
+    RESET_SUAVE_S = 3.0
 
     def _ubicar_reloj(self):
         """Lo deja centrado justo arriba de las dos flechitas."""
@@ -391,7 +519,7 @@ class Deck(QFrame):
     def _paso_reset_suave(self):
         k = min(1.0, (time.monotonic() - self._rs_t0) / self.RESET_SUAVE_S)
         self.reloj_reset.set_progreso(k)
-        e = 0.5 - 0.5 * math.cos(k * math.pi)                      # arranca y termina despacio
+        e = 0.5 - 0.5 * math.cos(k * math.pi)
         self.tempo_rate = self._rs_r0 + (1.0 - self._rs_r0) * e
         pct = int(round(self.tempo_rate * 100))
         if self.sld_tempo.value() != pct:
@@ -400,7 +528,7 @@ class Deck(QFrame):
         if k >= 1.0:
             self._rs_timer.stop(); self.tempo_rate = 1.0
             self._update_bpm_label()
-            QTimer.singleShot(350, lambda: None if self._rs_timer.isActive() else self.reloj_reset.hide())   # un instante completo y se va
+            QTimer.singleShot(350, lambda: None if self._rs_timer.isActive() else self.reloj_reset.hide())
 
     def _cancelar_reset_suave(self):
         t = getattr(self, "_rs_timer", None)
@@ -412,16 +540,14 @@ class Deck(QFrame):
         self._aj_gen = getattr(self, "_aj_gen", 0) + 1
         self.reloj_reset.hide()
 
-    # ---- reloj del AJUSTE AUTOMÁTICO de velocidad (sync / auto-enganche): el mismo relojito del Reset ----
     def _reset_activo(self):
         t = getattr(self, "_rs_timer", None)
         return t is not None and t.isActive()
 
     def mostrar_ajuste(self, k):
-        """Muestra el reloj con el progreso k (0..1) del ajuste de velocidad que hace el programa solo."""
         if self._reset_activo():
             return
-        self._aj_gen = getattr(self, "_aj_gen", 0) + 1            # cancela cualquier ocultamiento pendiente
+        self._aj_gen = getattr(self, "_aj_gen", 0) + 1
         self.reloj_reset.set_progreso(k)
         if not self.reloj_reset.isVisible():
             self._ubicar_reloj(); self.reloj_reset.show()
@@ -435,7 +561,6 @@ class Deck(QFrame):
         QTimer.singleShot(demora, _h)
 
     def barrido_ajuste(self, dur=1.3):
-        """El enganche cambió la velocidad de golpe: el reloj da una vuelta para que se note."""
         if self._reset_activo():
             return
         if getattr(self, "_aj_timer", None) is None:
@@ -453,8 +578,6 @@ class Deck(QFrame):
             self.ocultar_ajuste()
 
     def reset_tempo(self, suave=False):
-        """Solo vuelve el tempo al 100 % (y el microajuste a 1.0). NO toca la posición del tema.
-        Con suave=True y el tema sonando, la vuelta es progresiva (desimulada) en vez de un salto."""
         self.trim = 1.0
         self.tempo_manual = False
         self._cancelar_reset_suave()
@@ -467,7 +590,6 @@ class Deck(QFrame):
             self._rs_r0 = self.tempo_rate; self._rs_t0 = time.monotonic()
             self.reloj_reset.set_progreso(0.0); self._ubicar_reloj(); self.reloj_reset.show()
             self._rs_timer.start()
-        # Resetea el tempo_rate al 100% (slider incluido, sin disparar señales)
         elif abs(self.tempo_rate - 1.0) > 1e-6:
             self.tempo_rate = 1.0
             pct = 100
@@ -476,7 +598,6 @@ class Deck(QFrame):
                 self.sld_tempo.setValue(pct)
                 self.sld_tempo.blockSignals(False)
         self._update_bpm_label()
-        # Avisar a la ventana (redibuja timeline, status, etc.)
         if self.on_reset_cb is not None:
             try:
                 self.on_reset_cb(self)
@@ -488,7 +609,7 @@ class Deck(QFrame):
     def _update_tempo(self):
         self._cancelar_reset_suave()
         self.tempo_rate = self.sld_tempo.value() / 100.0
-        self.tempo_manual = (self.sld_tempo.value() != 100)      # (los cambios por programa bloquean la señal: esto es del usuario)
+        self.tempo_manual = (self.sld_tempo.value() != 100)
         _log_diferido(f"tempo{self.name}", f"deck {self.name}", f"tempo manual {self.sld_tempo.value()} % ({(self.original_bpm or 0) * self.tempo_rate:.1f} BPM)")
         self._update_bpm_label()
 
@@ -518,14 +639,14 @@ class Deck(QFrame):
         with self.lock:
             self.cursor = int(t * self.sr)
             self._cursor_frac = 0.0
-            self.loop = None; self.loop_desfase = 0.0; self._loop_salir = False      # mover el tema a mano suelta el loop
+            self.loop = None; self.loop_desfase = 0.0; self._loop_salir = False
 
     def tick(self):
         if self.analysis and self.audio is not None:
             pos = self.position_seconds()
             self.lbl_time.setText(f"{fmt_time(pos)} / {fmt_time(self.analysis['duration'])}")
 
-    WSOLA = True            # False: las velocidades distintas de 1,0 cambian el tono (remuestreo, como un disco de vinilo)
+    WSOLA = True
 
     def _render_directo(self, frames, rate):
         """Lectura sin estirado: exacta a velocidad 1,0 y, si no, por remuestreo cúbico (cambia el tono)."""
@@ -556,12 +677,10 @@ class Deck(QFrame):
         self.cursor += int_adv
         return (y * valid).astype(np.float32)
 
-    WS_ENTRA = 0.020          # el estirado (WSOLA) se usa solo si la velocidad se aparta más de esto de 1,0 ...
-    WS_SALE = 0.012           # ... y se abandona recién por debajo de esto (histéresis: no cambia de modo a cada rato)
+    WS_ENTRA = 0.020
+    WS_SALE = 0.012
 
     def _ws_usar(self, rate):
-        """Con diferencias de velocidad chicas (< ~2 %) el WSOLA agrega un temblor leve y el remuestreo directo solo
-        cambia el tono unos centésimos de semitono (imperceptible), así que ahí se lee directo."""
         d = abs(rate - 1.0)
         if d <= 1e-9:
             self._ws_modo = False
@@ -572,16 +691,15 @@ class Deck(QFrame):
         return self._ws_modo
 
     def _render_wsola(self, frames, rate):
-        """Lectura con WSOLA: la velocidad cambia pero el tono se mantiene. El cursor sigue la posición real en el tema."""
         salto = False
         if not self._ws_activo or self._ws_exp != (self.cursor, self._cursor_frac):
-            salto = self._ws_activo                                  # había estirado en marcha: es un salto de posición
-            self._ws.reset(self.cursor + self._cursor_frac)          # arranque, o alguien movió el cursor (salto, manito…)
+            salto = self._ws_activo
+            self._ws.reset(self.cursor + self._cursor_frac)
             self._ws_activo = True
         y, fin = self._ws.leer(self.audio, frames, float(np.clip(rate, 0.5, 2.0)))
         if salto:
-            self._ws_fi_pos = 0                                              # entrada suave: sin chasquido al saltar
-        if self._ws_fi_pos < 128:                                            # (el fundido sigue en los bloques siguientes si este es corto)
+            self._ws_fi_pos = 0
+        if self._ws_fi_pos < 128:
             k = min(128 - self._ws_fi_pos, frames)
             y[:k] *= ((np.arange(k, dtype=np.float32) + self._ws_fi_pos + 1.0) / 128.0)[:, None]
             self._ws_fi_pos += k
@@ -599,11 +717,11 @@ class Deck(QFrame):
             if not self.playing or self.audio is None:
                 return out
             rate = self.rate_eff
-            ganancia_total = self.auto_gain * NIVEL_V2   # el volumen (por bandas) lo aplica el mezclador
+            ganancia_total = self.auto_gain * NIVEL_V2
             try:
                 if Deck.WSOLA and self._ws_usar(rate):
                     y = self._render_wsola(frames, rate)
-                elif self._ws_activo:                    # deja el estirado (rate 1,0 o muy cerca): unos ms de fundido hacia la lectura directa
+                elif self._ws_activo:
                     if self._ws_exp == (self.cursor, self._cursor_frac):
                         h0 = self._ws.head
                         y_ws, _ = self._ws.leer(self.audio, frames, float(np.clip(rate, 0.5, 2.0)))
@@ -618,15 +736,14 @@ class Deck(QFrame):
                     y = self._render_directo(frames, rate)
             except Exception:
                 import traceback; traceback.print_exc()
-                Deck.WSOLA = False                       # ante cualquier fallo se vuelve al remuestreo de siempre
+                Deck.WSOLA = False
                 self._ws_activo = False
                 print("[audio] WSOLA desactivado por un error: se usa el remuestreo")
                 y = self._render_directo(frames, rate)
             out[:] = y * ganancia_total
         return out
 
-    # ---- LOOP (repetir un trozo del tema, pegado a la grilla) ---------------------------------
-    LOOP_FADE = 48            # muestras (~1 ms) de fundido en el empalme del loop: sin chasquido
+    LOOP_FADE = 48
 
     def render(self, frames):
         if self.loop is None and not self._loop_salir:
@@ -634,7 +751,6 @@ class Deck(QFrame):
         return self._render_loop(frames)
 
     def iniciar_loop(self, n_beats):
-        """Loop de n_beats tiempos, desde el golpe más cercano. Devuelve True si pudo."""
         if self.audio is None or not self.analysis:
             return False
         b = np.asarray(self.analysis.get("beats_full") or self.analysis.get("beats") or [], dtype=np.float64)
@@ -657,11 +773,10 @@ class Deck(QFrame):
         return True
 
     def terminar_loop(self):
-        """Suelta el loop: el tema sigue por donde estaría si nunca hubiera repetido (así no se pierde el compás)."""
         if self.loop is None:
             return
         if self.playing:
-            self._loop_salir = True            # lo resuelve el audio en el próximo bloque, con fundido
+            self._loop_salir = True
         else:
             self._saltar_a_virtual()
 
@@ -673,7 +788,6 @@ class Deck(QFrame):
             self.loop = None; self.loop_desfase = 0.0; self._loop_salir = False
 
     def _aplicar_fi(self, y, F):
-        """Fundido de entrada tras un salto del loop (continúa en el bloque siguiente si este es muy corto)."""
         if self._fi_pend:
             k = min(F - self._fi_pos, len(y))
             if k > 0:
@@ -684,7 +798,6 @@ class Deck(QFrame):
         return y
 
     def _tramo_loop(self, n, F):
-        """n muestras de salida respetando el loop: al llegar al final vuelve al inicio (con fundidos de ~1 ms)."""
         out = np.zeros((n, 2), dtype=np.float32)
         h = 0; vueltas = 0
         while h < n and vueltas < 12:
@@ -704,7 +817,7 @@ class Deck(QFrame):
                 if self.loop is None:
                     break
                 pos2 = self.cursor + self._cursor_frac
-                if pos2 >= fin - 2.0 * rate:                       # llegó al final del loop: vuelve al inicio
+                if pos2 >= fin - 2.0 * rate:
                     over = max(0.0, pos2 - fin)
                     nueva = ini + over
                     self.cursor = int(nueva); self._cursor_frac = nueva - self.cursor

@@ -53,8 +53,7 @@ def refine_onsets_to_peak(onset_env, onsets_frames, hop, sr, win_frames=3):
 def detect_kicks(y, sr):
     y_low = lowpass_kick(y, sr, cutoff=150.0, order=4)
     hop = 256
-    env = librosa.onset.onset_strength(y=y_low, sr=sr, hop_length=hop,
-                                       aggregate=np.median)
+    env = librosa.onset.onset_strength(y=y_low, sr=sr, hop_length=hop)      # (con aggregate=np.median daba 0 bombos en todos los temas)
     onsets_frames = librosa.onset.onset_detect(
         onset_envelope=env, sr=sr, hop_length=hop,
         backtrack=False, units="frames",
@@ -157,7 +156,22 @@ def _cerrar_pool():
 
 
 
-def analizar_archivo(path, solo_clave=False):
+def _bajar_prioridad():
+    """Se ejecuta dentro de cada proceso que analiza la biblioteca: prioridad baja, así el audio y la ventana no se traban."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            k = ctypes.windll.kernel32
+            k.SetPriorityClass(k.GetCurrentProcess(), 0x00004000)       # BELOW_NORMAL
+        else:
+            os.nice(10)
+    except Exception:
+        pass
+
+
+
+
+def analizar_archivo(path, solo_clave=False, solo_uno=None):
     """El análisis (librosa/numba) retiene el GIL por momentos y trababa el audio ('rrrr').
     Se hace en un proceso aparte; si eso falla o se cuelga, se hace acá como antes."""
     global _POOL, _POOL_BLOQ_HASTA, _POOL_USOS
@@ -172,7 +186,10 @@ def analizar_archivo(path, solo_clave=False):
                     if os.name == "nt" and pw.exists():
                         ctx.set_executable(str(pw))
                     _POOL = ProcessPoolExecutor(max_workers=1, mp_context=ctx)
-                res = _POOL.submit(_analizar_clave if solo_clave else _analizar_archivo, path).result(timeout=TIMEOUT_ANALISIS)
+                if solo_uno is not None:
+                    res = _POOL.submit(_analizar_uno, (path, solo_uno)).result(timeout=TIMEOUT_ANALISIS)
+                else:
+                    res = _POOL.submit(_analizar_clave if solo_clave else _analizar_archivo, path).result(timeout=TIMEOUT_ANALISIS)
                 _POOL_USOS += 1
                 if _POOL_USOS >= POOL_RENOVAR_CADA:
                     _POOL_USOS = 0
@@ -186,6 +203,8 @@ def analizar_archivo(path, solo_clave=False):
                 if isinstance(e, (_TO, BrokenProcessPool, OSError)):
                     _POOL_BLOQ_HASTA = time.monotonic() + 600.0
                     print(f"[análisis] el proceso aparte falló ({type(e).__name__}); se analiza en el programa durante unos minutos")
+        if solo_uno is not None:
+            return _analizar_uno((path, solo_uno))
         return _analizar_clave(path) if solo_clave else _analizar_archivo(path)
 
 
@@ -464,6 +483,67 @@ def desfase_rejilla_bombos(res):
 
 
 
+def _desfase_rejilla_downbeats(res):
+    """Fallback cuando no hay bombos claros (acústica, clásica, ambient):
+    mide dónde cae el MÁXIMO de energía RMS dentro de cada compás (downbeat a downbeat).
+    Como los compases están más espaciados que los beats, la waveform sub-muestreada (2000 pts) alcanza
+    para tener resolución ~2-3 muestras por bin."""
+    try:
+        db = np.asarray(res.get("downbeats_full") or res.get("downbeats") or [], dtype=np.float64)
+        wf = res.get("waveform") or []
+        dur = float(res.get("duration") or 0)
+        if len(db) < 16 or len(wf) < 200 or dur <= 0:
+            return None
+        period = float(np.median(np.diff(db)))
+        if not (0.5 < period < 10.0):              # compases entre 6 y 120 BPM: plausible
+            return None
+        n = len(wf)
+        step = dur / n
+        if period / step < 8:                       # muy pocos puntos por compás: no sirve
+            return None
+        if len(db) > 100:                           # no hace falta más de 100 compases
+            db = db[::len(db) // 100]
+        BINS = 32
+        hist = np.zeros(BINS); counts = np.zeros(BINS)
+        for b in db:
+            for k in range(BINS):
+                t = b + (k / BINS) * period
+                j = int(t / step)
+                if 0 <= j < n:
+                    hist[k] += wf[j]; counts[k] += 1
+        if counts.min() <= 0:
+            return None
+        hist /= counts
+        if hist.max() <= 0:
+            return None
+        # suavizar circular y buscar el pico
+        hist_s = np.convolve(np.r_[hist[-2:], hist, hist[:2]], np.ones(5) / 5, "same")[2:-2]
+        peak = int(np.argmax(hist_s))
+        offset = (peak / BINS) * period
+        if offset > period / 2:                     # envolver: pico "tarde" = pico "temprano del próximo compás"
+            offset -= period
+        if abs(offset) > 0.08:                      # más de 80 ms → sospechoso, no confiar
+            return None
+        return float(offset)
+    except Exception:
+        return None
+
+
+
+
+def desfase_rejilla_auto(res):
+    """Desfase de la grilla probando VARIAS formas; devuelve la primera medición válida.
+    1) Bombos (mediana): precisa si hay kick claro (electrónica, pop, rock).
+    2) Downbeats + RMS: fallback para música sin kick (acústica, clásica, ambient).
+    Devuelve segundos (positivo = grilla adelantada, hay que correrla hacia adelante) o None."""
+    d = desfase_rejilla_bombos(res)
+    if d is not None:
+        return d
+    return _desfase_rejilla_downbeats(res)
+
+
+
+
 def desplazar_rejilla(res, seg):
     """Corre toda la grilla (tiempos y compases) `seg` segundos."""
     for k_full, k_draw in (("beats_full", "beats"), ("downbeats_full", "downbeats")):
@@ -472,6 +552,105 @@ def desplazar_rejilla(res, seg):
     res["grid"] = 1
     res["manual"] = True
     return res
+
+
+
+
+# ---------------------------------------------------------------------
+# El "1" del compás, automático. Se decide por votación sobre TODOS los compases del tema (no solo el principio):
+# la posición (0-3) donde el bombo pega más fuerte gana; el cambio de armonía (acorde nuevo) sirve de desempate suave.
+# Se probó contra temas cuyo "1" había corregido Gustavo a mano: el acento del bombo acertó en todos, mientras que
+# sumar energía general / subidas de volumen metía ruido en la cumbia, así que esas pistas no se usan.
+# Además de la fase devuelve una confianza 0-1: si es baja, el "1" se marca como dudoso (igual se usa el mejor).
+# ---------------------------------------------------------------------
+UNO_CONF_MIN = 0.40
+UNO_PESO_BOMBO, UNO_PESO_ARMONIA = 1.0, 0.25
+
+
+def _z_robusto(v):
+    v = np.asarray(v, dtype=np.float64)
+    med = float(np.median(v))
+    mad = float(np.median(np.abs(v - med))) * 1.4826
+    if mad < 1e-9:
+        mad = float(v.std()) or 1.0
+    return np.clip((v - med) / mad, -3.0, 3.0)
+
+
+UNO_MAX_BEATS, UNO_N_FFT = 100000, 2048  # se vota sobre TODO el tema (un tramo más corto cambiaba la respuesta en temas dudosos); n_fft 2048 = mismo resultado, ~2x más rápido
+
+
+def detectar_uno(y, sr, beats, max_beats=None, n_fft=None):
+    """Fase del "1" sobre la lista de beats: devuelve (fase 0-3, confianza 0-1) o None si hay muy pocos datos.
+    `beats` = tiempos (s) de la grilla; el "1" cae en los beats j tales que j % 4 == fase."""
+    max_beats = max_beats or UNO_MAX_BEATS; n_fft = n_fft or UNO_N_FFT
+    b = np.asarray(beats, dtype=np.float64)
+    if len(b) < 16 or len(y) < sr * 8:
+        return None
+    per = float(np.median(np.diff(b)))
+    if not (0.25 < per < 1.5):
+        return None
+    if len(b) > max_beats:                          # tramo central; el inicio es múltiplo de 4, así la fase no cambia
+        i0 = ((len(b) - max_beats) // 2) // 4 * 4
+        b = b[i0:i0 + max_beats]
+    t0 = max(0.0, float(b[0]) - 2.0 * per); t1 = min(len(y) / float(sr), float(b[-1]) + 2.0 * per)
+    y = y[int(t0 * sr):int(t1 * sr)]
+    b = b - t0
+    n = len(b)
+    hop = 512
+    yl = lowpass_kick(y, sr, cutoff=150.0)
+    env_l = librosa.onset.onset_strength(y=yl, sr=sr, hop_length=hop)
+    ch = librosa.feature.chroma_stft(y=y, sr=sr, n_fft=n_fft, hop_length=hop)
+    nf = min(len(env_l), ch.shape[1])
+    env_l, ch = env_l[:nf], ch[:, :nf]
+    fps = sr / float(hop)
+
+    def fr(t):
+        return int(np.clip(round(t * fps), 0, nf - 1))
+
+    f_kick = np.zeros(n); f_arm = np.zeros(n)
+    for i, t in enumerate(b):
+        a, z = fr(t - 0.08 * per), fr(t + 0.12 * per) + 1       # el golpe: poco antes y poco después del beat
+        f_kick[i] = float(env_l[a:z].max())
+        p0, p1 = fr(t - per), max(fr(t - 0.05 * per), fr(t - per) + 1)
+        q0, q1 = fr(t + 0.05 * per), max(fr(t + per), fr(t + 0.05 * per) + 1)
+        pre, pos = ch[:, p0:p1].mean(axis=1), ch[:, q0:q1].mean(axis=1)
+        den = float(np.linalg.norm(pre) * np.linalg.norm(pos))
+        f_arm[i] = 1.0 - float(pre @ pos) / den if den > 1e-9 else 0.0       # cuánto cambia la armonía justo en este beat
+    comb = UNO_PESO_BOMBO * _z_robusto(f_kick) + UNO_PESO_ARMONIA * _z_robusto(f_arm)
+    fase = np.arange(n) % 4
+    punt = np.array([comb[fase == p].mean() for p in range(4)])
+    orden = np.argsort(punt)[::-1]
+    margen = float(punt[orden[0]] - punt[orden[1]])
+    ruido = float(comb.std()) * np.sqrt(2.0 / max(1.0, n / 4.0))      # error típico de la diferencia entre dos fases
+    conf = float(np.clip(margen / (4.0 * ruido + 1e-9), 0.0, 1.0))
+    return int(orden[0]), conf
+
+
+def aplicar_uno(res, fase, conf):
+    """Pone los downbeats del análisis `res` en los beats j con j % 4 == fase (modifica `res`)."""
+    bt = np.asarray(res.get("beats_full") or [], dtype=np.float64)
+    if len(bt) < 8:
+        return False
+    db = bt[np.arange(len(bt)) % 4 == int(fase)]
+    def _ralo(v, tope):
+        v = list(map(float, v))
+        return v if len(v) <= tope else v[::len(v) // tope + 1]
+    res["downbeats_full"] = list(map(float, db)); res["downbeats"] = _ralo(db, 200)
+    res["uno_auto"] = 1
+    res["uno_conf"] = float(conf)
+    return True
+
+
+def _analizar_uno(args):
+    """Para análisis viejos sin el "1" automático: carga el audio y lo calcula (corre en el proceso aparte)."""
+    path, beats = args
+    y, sr = librosa.load(path, sr=22050, mono=True)
+    r = detectar_uno(y, sr, beats)
+    try:
+        kicks = [float(k) for k in detect_kicks(y, sr)]           # los análisis viejos tenían 0 bombos (error ya corregido)
+    except Exception:
+        kicks = []
+    return {"uno": None if r is None else [int(r[0]), float(r[1])], "kicks": kicks}
 
 
 
@@ -556,8 +735,13 @@ def analizar_voz(y, sr):
         from scipy.ndimage import uniform_filter1d
         hop = 1024
         S = np.abs(librosa.stft(y, n_fft=2048, hop_length=hop))
-        H, _P = librosa.decompose.hpss(S, kernel_size=(15, 15))
         f = librosa.fft_frequencies(sr=sr, n_fft=2048)
+        # El HPSS (lo más lento del análisis) solo hace falta en la banda 300 Hz–3,4 kHz: se calcula sobre esas filas más 8 de
+        # margen (el filtro mira ±7), con el mismo resultado dentro de la banda y ~3 veces más rápido.
+        k0 = int(np.searchsorted(f, 300.0)) - 8; k1 = int(np.searchsorted(f, 3400.0, side="right")) + 8
+        k0, k1 = max(0, k0), min(len(f), k1)
+        Hb, _P = librosa.decompose.hpss(S[k0:k1], kernel_size=(15, 15))
+        fb = f[k0:k1]
         suav = max(3, int(round(0.9 * sr / hop)))
         def norm(v):
             v = uniform_filter1d(v.astype(np.float64), suav)
@@ -567,7 +751,7 @@ def analizar_voz(y, sr):
         # contra el propio máximo del tema), así un tema sin voz no se "infla" y uno con voz sí destaca.
         # VOZ_BAJA/VOZ_ALTA calibran el mapa a 0..1: por debajo de VOZ_BAJA no hay nada, por encima de VOZ_ALTA hay voz plena.
         VOZ_BAJA, VOZ_ALTA = 0.06, 0.22
-        frac = H[(f >= 300) & (f <= 3400)].sum(axis=0) / (S.sum(axis=0) + 1e-9)
+        frac = Hb[(fb >= 300) & (fb <= 3400)].sum(axis=0) / (S.sum(axis=0) + 1e-9)
         voz = np.clip((uniform_filter1d(frac, suav) - VOZ_BAJA) / (VOZ_ALTA - VOZ_BAJA), 0.0, 1.0)
         bajo = norm(S[(f >= 40) & (f <= 200)].sum(axis=0))
         t_fr = np.arange(len(voz)) * hop / float(sr)
@@ -702,6 +886,7 @@ def _analizar_archivo(path):
         _grilla_final(res_out, grilla)
     else:
         res_out["grid"] = 0                             # no hay pulso fijo claro: se queda la grilla detectada
+    # (el "1" del compás NO se calcula acá, para que analizar la biblioteca siga rápido: se completa al cargar el tema en un deck)
     return res_out
 
 

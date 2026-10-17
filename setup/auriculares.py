@@ -17,38 +17,50 @@ class _Previa:
 
 class Auriculares:
     """Segunda salida de audio (por ejemplo un DAC USB). Recibe, bloque a bloque, el audio de los decks marcados
-    (antes del crossfader, por eso se oye aunque a los parlantes no llegue nada) y lo reproduce por su propio dispositivo.
-    Como son dos placas con relojes distintos, entre las dos hay una pequeña cola de amortiguación."""
+    (antes del crossfader) y lo reproduce por su propio dispositivo. El alimentado usa buffers PRE-ALOCADOS y `out=`:
+    no aloca en el callback de audio principal."""
     PREVIO_MIN = 4        # bloques que se juntan antes de empezar a sonar (evita cortes por llegar justo)
     PREVIO_MAX = 14       # si se cortan seguido (Bluetooth entrega a ráfagas), el colchón crece solo hasta acá
-    MAX_EXTRA = 6         # cuántos bloques de más se aguantan antes de descartar los más viejos (relojes de placas distintas)
+    MAX_EXTRA = 6         # cuántos bloques de más se aguantan antes de descartar los más viejos
+    POOL = 20             # buffers pre-alocados (20 × 8 KB ≈ 160 KB)
 
     def __init__(self, sr, bloque=1024):
         self.sr = sr
         self.bloque = bloque
         self.stream = None
-        self.nombre = ""             # dispositivo abierto
+        self.nombre = ""
         self.error = ""
         self.canales = 2
         self.PREVIO = self.PREVIO_MIN
         self.MAX_BLOQUES = self.PREVIO + self.MAX_EXTRA
-        self.cortes = 0              # cuántas veces se vació la cola (para agrandar el colchón)
-        self.GANANCIA = 3.5          # refuerzo propio de los auriculares (+11 dB): la salida principal queda igual
-        self.vol = 0.8               # 0..1 (se aplica al cuadrado, como el volumen general)
+        self.cortes = 0
+        self.GANANCIA = 3.5
+        self.vol = 0.8
         self.cue_a = False
         self.cue_b = False
-        self.decks = {}              # {"A": deck, "B": deck} (los pone la ventana)
+        self.decks = {}
         self.prev = {"A": _Previa(), "B": _Previa()}
         self._cola = deque()
         self._lock = threading.Lock()
-        self._sonando = False        # ya se juntó el colchón previo
+        self._sonando = False
+        # ---- Sin allocations en `alimentar`: buffer scratch + pool ----
+        self._scratch_cue = np.empty((bloque, 2), dtype=np.float32)
+        self._pool = [np.empty((bloque, 2), dtype=np.float32) for _ in range(self.POOL)]
+
+    def _tomar_buffer(self, frames):
+        if self._pool:
+            buf = self._pool.pop()
+            if buf.shape[0] == frames:
+                return buf
+        return np.empty((frames, 2), dtype=np.float32)
+
+    def _devolver_buffer(self, buf):
+        if len(self._pool) < self.POOL and buf.shape == (self.bloque, 2):
+            self._pool.append(buf)
 
     # ---- dispositivos -------------------------------------------------
     @staticmethod
     def listar(excluir=None):
-        """[(índice, nombre para mostrar, canales, API de audio)] de todas las salidas. Las de la API que usa el programa
-        van primero y con su nombre a secas; las de otras APIs (WASAPI, DirectSound) llevan [API] al final. Los auriculares
-        Bluetooth a veces solo aparecen en alguna de ellas, o como mono (perfil de llamadas)."""
         res = []
         try:
             try:
@@ -66,7 +78,7 @@ class Auriculares:
                 ha = d.get("hostapi")
                 api = apis[ha]["name"] if apis and ha is not None and 0 <= ha < len(apis) else ""
                 if "WDM" in api or "ASIO" in api:
-                    continue                                   # esas dos APIs son delicadas: no se ofrecen
+                    continue
                 vis = d["name"] if (api_def is None or ha == api_def) else f"{d['name']} [{api}]"
                 if ch == 1:
                     vis += " · mono"
@@ -74,8 +86,6 @@ class Auriculares:
         except Exception:
             pass
         res.sort(key=lambda x: (not x[4], x[0]))
-        # solo lo que sirve: sin las entradas genéricas de Windows, sin repetidos (el mismo aparato aparece una vez por
-        # cada API de audio; MME recorta los nombres a ~31 letras) y sin el aparato que ya usa la salida principal
         def norm(t):
             return " ".join(t.lower().split())[:28]
         ex = norm(excluir) if excluir else None
@@ -96,8 +106,6 @@ class Auriculares:
 
     @staticmethod
     def nombres_presentes():
-        """Nombres (en minúscula) de las salidas que Windows tiene AHORA, leídas directo de winmm sin tocar PortAudio
-        (PortAudio solo ve los dispositivos del momento en que arrancó). None si no se puede saber."""
         try:
             import os, ctypes
             if os.name != "nt":
@@ -118,7 +126,6 @@ class Auriculares:
             return None
 
     def sigue_presente(self):
-        """False si el dispositivo de auriculares abierto ya no figura en Windows (lo desenchufaron o se apagó)."""
         if self.stream is None or not self.nombre:
             return True
         pres = self.nombres_presentes()
@@ -128,7 +135,6 @@ class Auriculares:
 
     @staticmethod
     def coincide(nombre, presente):
-        """¿El nombre que muestra la lista corresponde a este nombre de winmm (recortado a 31 letras)?"""
         base = " ".join(nombre.split(" [")[0].replace(" · mono", "").lower().split())
         p = presente
         return len(p) >= 6 and (p in base or base in p or base[:28] == p[:28])
@@ -144,7 +150,7 @@ class Auriculares:
             extra = None
             if "WASAPI" in api:
                 try:
-                    extra = sd.WasapiSettings(auto_convert=True)     # que Windows adapte la frecuencia (44,1 → 48 kHz, etc.)
+                    extra = sd.WasapiSettings(auto_convert=True)
                 except Exception:
                     extra = None
             self.canales = 1 if canales < 2 else 2
@@ -173,7 +179,8 @@ class Auriculares:
 
     # ---- audio ----------------------------------------------------------
     def alimentar(self, a, b):
-        """Lo llama el callback principal con el audio de cada deck ya renderizado (antes del crossfader)."""
+        """Lo llama el callback principal con el audio de cada deck ya renderizado (antes del crossfader).
+        Usa el buffer `_scratch_cue` y `out=` para no alocar en el hilo de audio."""
         if self.stream is None:
             return
         ca, cb = self.cue_a, self.cue_b
@@ -183,26 +190,42 @@ class Auriculares:
                 with self._lock:
                     self._cola.clear(); self._sonando = False
             return
-        cue = None
+
+        n = len(a)
+        scratch = self._scratch_cue
+        if scratch.shape[0] < n:
+            scratch = np.empty((n, 2), dtype=np.float32)
+            self._scratch_cue = scratch
+        scratch[:n].fill(0.0)
+
+        any_added = False
         for nom, vivo, flag in (("A", a, ca), ("B", b, cb)):
-            if self.prev[nom].playing:                       # la previa propia reemplaza al deck en vivo
-                x = self._render_previa(nom, len(a))
+            if self.prev[nom].playing:
+                x = self._render_previa(nom, n)
             else:
-                x = vivo if flag else None
+                x = vivo[:n] if flag else None
             if x is not None:
-                cue = x if cue is None else cue + x
-        if cue is None:
+                np.add(scratch[:n], x, out=scratch[:n])
+                any_added = True
+        if not any_added:
             return
+
+        # saturación suave en el mismo buffer (out=): cero alloc
         g = float(self.vol) ** 2
-        cue = np.tanh(cue * (g * self.GANANCIA)).astype(np.float32)      # saturación suave: sube el volumen sin cortes feos
+        np.multiply(scratch[:n], g * self.GANANCIA, out=scratch[:n])
+        np.tanh(scratch[:n], out=scratch[:n])
+
+        # copia al buffer del pool para encolar (la cola no puede tener referencias al scratch)
+        buf = self._tomar_buffer(n)
+        np.copyto(buf[:n], scratch[:n])
         with self._lock:
-            self._cola.append(cue)
+            self._cola.append(buf)
             while len(self._cola) > self.MAX_BLOQUES:
-                self._cola.popleft()
+                old = self._cola.popleft()
+                self._devolver_buffer(old)
 
     # ---- previa propia (play de auriculares) ----------------------------
     def previa_play(self, nom):
-        """Empieza (o sigue) la previa del deck. La primera vez tras cargar un tema arranca donde está el deck."""
         d = self.decks.get(nom)
         p = self.prev[nom]
         if d is None or d.audio is None:
@@ -238,7 +261,7 @@ class Auriculares:
         p = self.prev[nom]
         d = self.decks.get(nom)
         au = d.audio if d is not None else None
-        if au is None or au is not p.audio:                  # se cargó otro tema: la previa se detiene
+        if au is None or au is not p.audio:
             p.playing = False
             return None
         rate = float(d.rate_eff)
@@ -263,6 +286,7 @@ class Auriculares:
         return (y * (d.auto_gain * NIVEL_V2)).astype(np.float32)
 
     def _cb(self, outdata, frames, time_info, status):
+        partes = []; falta = frames
         with self._lock:
             if not self._sonando:
                 if len(self._cola) >= self.PREVIO:
@@ -270,22 +294,21 @@ class Auriculares:
             if not self._sonando:
                 outdata[:] = 0
                 return
-            partes = []; falta = frames
             while falta > 0 and self._cola:
                 blk = self._cola[0]
                 if len(blk) <= falta:
                     partes.append(blk); self._cola.popleft(); falta -= len(blk)
                 else:
                     partes.append(blk[:falta]); self._cola[0] = blk[falta:]; falta = 0
-            if falta > 0:                      # se vació: vuelve a juntar el colchón
+            if falta > 0:
                 partes.append(np.zeros((falta, 2), dtype=np.float32))
                 self._sonando = False
                 self.cortes += 1
-                if self.PREVIO < self.PREVIO_MAX:          # se cortó: la próxima vez se junta un colchón más grande
+                if self.PREVIO < self.PREVIO_MAX:
                     self.PREVIO += 2
                     self.MAX_BLOQUES = self.PREVIO + self.MAX_EXTRA
         blk = np.concatenate(partes) if len(partes) > 1 else partes[0]
-        if outdata.shape[1] == 1:                      # salida mono (Bluetooth en perfil de llamadas): mezcla L+R
+        if outdata.shape[1] == 1:
             outdata[:, 0] = blk.mean(axis=1)
         else:
             outdata[:] = blk

@@ -102,6 +102,29 @@ class BibliotecaMixin:
         guardar_config(lib_agrupada=bool(v))
         self._set_status("📂 Lista separada por carpetas (clic en un título para cerrarlo o abrirlo)" if v else "📃 Lista plana")
 
+    # ---------- botón << (contraer / expandir todas las carpetas) ----------
+    def _toggle_plegar_carpetas(self):
+        """Botón << del buscador: contrae / expande TODAS las carpetas. Si la vista por carpetas está apagada,
+        la activa primero y deja todo contraído."""
+        bib = self.biblioteca
+        if not bib.agrupado:
+            self.btn_agrupar.setChecked(True)      # activa «Por carpetas» (dispara _alternar_agrupada)
+            bib.plegar_todas()
+            self.btn_plegar.setText(">>")
+            self.btn_plegar.setToolTip("Expandir todas las carpetas")
+            self._set_status("📂 Carpetas contraídas")
+            return
+        if bib.todas_plegadas():
+            bib.desplegar_todas()
+            self.btn_plegar.setText("<<")
+            self.btn_plegar.setToolTip("Contraer todas las carpetas")
+            self._set_status("📂 Carpetas expandidas")
+        else:
+            bib.plegar_todas()
+            self.btn_plegar.setText(">>")
+            self.btn_plegar.setToolTip("Expandir todas las carpetas")
+            self._set_status("📂 Carpetas contraídas")
+
     def _ordenar_biblioteca_tono(self):
         self._orden_tono = True                               # se mantiene mientras se analiza y suenan los temas
         self.biblioteca.ordenar_por_tono()
